@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""TermFix Step 2: proof-backed executable correction.
+"""TermFix Steps 2-3: proof-backed executable and path correction.
 
-This version inspects only the executable token. It never executes the command.
-Every correction candidate is discovered from the local PATH and ranked with
-deterministic standard-library logic.
+Executable candidates come from PATH. File and directory candidates come from
+the relevant local directory. Every match is deterministic, and the inspected
+command is never executed.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from unittest import mock
 
 
 APP_NAME = "TermFix"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -72,6 +72,23 @@ class Correction:
     @property
     def suggested_argv(self) -> tuple[str, ...]:
         return (self.suggested_token, *self.original_arguments)
+
+
+@dataclass(frozen=True)
+class PathCorrection:
+    """A proof-backed replacement for one file or directory argument."""
+
+    token_index: int
+    original_token: str
+    suggested_token: str
+    original_component: str
+    suggested_component: str
+    category: str
+    score: int
+    label: MatchLabel
+    reason: str
+    evidence: str
+    resolved_path: str
 
 
 def selected_environment(env: dict[str, str] | None) -> dict[str, str]:
@@ -137,10 +154,11 @@ def discover_executables(
         visited_directories.add(directory_key)
 
         try:
-            entries = sorted(
-                os.scandir(directory),
-                key=lambda entry: (entry.name.casefold(), entry.name),
-            )
+            with os.scandir(directory) as directory_entries:
+                entries = sorted(
+                    directory_entries,
+                    key=lambda entry: (entry.name.casefold(), entry.name),
+                )
         except (OSError, ValueError):
             continue
 
@@ -173,7 +191,11 @@ def discover_executables(
     return tuple(
         sorted(
             discovered.values(),
-            key=lambda candidate: (candidate.name.casefold(), candidate.name, candidate.path.casefold()),
+            key=lambda candidate: (
+                candidate.name.casefold(),
+                candidate.name,
+                candidate.path.casefold(),
+            ),
         )
     )
 
@@ -268,7 +290,11 @@ def find_correction(
     environment = selected_environment(env)
     is_windows = os.name == "nt" if windows is None else windows
     target, supplied_extension = command_stem(original, environment, is_windows)
-    available = discover_executables(environment, windows=is_windows) if candidates is None else candidates
+    available = (
+        discover_executables(environment, windows=is_windows)
+        if candidates is None
+        else candidates
+    )
 
     ranked: list[tuple[int, str, str, ExecutableCandidate, str]] = []
     for candidate in available:
@@ -306,6 +332,224 @@ def find_correction(
     )
 
 
+def safe_path_exists(path: Path) -> bool:
+    """Check path existence without allowing malformed or inaccessible paths to crash."""
+
+    try:
+        return path.exists()
+    except (OSError, ValueError):
+        return False
+
+
+def safe_is_directory(path: Path) -> bool:
+    """Check whether a path is a directory while containing filesystem errors."""
+
+    try:
+        return path.is_dir()
+    except (OSError, ValueError):
+        return False
+
+
+def local_path(token: str, cwd: Path) -> Path:
+    """Resolve a user token against the inspected working directory."""
+
+    candidate = Path(token)
+    return candidate if candidate.is_absolute() else cwd / candidate
+
+
+def looks_like_path(token: str, cwd: Path) -> bool:
+    """Conservatively identify arguments that can safely be treated as paths."""
+
+    if not token or token.startswith("-"):
+        return False
+    if "://" in token or any(character in token for character in "*?[]"):
+        return False
+
+    try:
+        candidate = Path(token)
+        if candidate.drive and not candidate.is_absolute():
+            return False
+        return (
+            contains_path_separator(token)
+            or bool(candidate.suffix)
+            or token in (".", "..")
+            or safe_path_exists(local_path(token, cwd))
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def restore_path_style(original: str, rebuilt: Path) -> str:
+    """Keep the user's slash style and explicit current-directory prefix."""
+
+    suggested = str(rebuilt)
+    if "/" in original and "\\" not in original:
+        suggested = suggested.replace("\\", "/")
+
+    if original.startswith("./") and not suggested.startswith("./"):
+        suggested = "./" + suggested
+    elif original.startswith(".\\") and not suggested.startswith(".\\"):
+        suggested = ".\\" + suggested
+
+    if original.endswith("/") and not suggested.endswith("/"):
+        suggested += "/"
+    elif original.endswith("\\") and not suggested.endswith("\\"):
+        suggested += "\\"
+    return suggested
+
+
+def find_path_correction(
+    token: str,
+    token_index: int,
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> PathCorrection | None:
+    """Correct at most one path component and prove the final path exists."""
+
+    working_directory = Path.cwd() if cwd is None else Path(cwd)
+    if not looks_like_path(token, working_directory):
+        return None
+
+    try:
+        original_path = Path(token)
+        if safe_path_exists(local_path(token, working_directory)):
+            return None
+
+        original_parts = list(original_path.parts)
+        if original_path.is_absolute():
+            base = Path(original_path.anchor)
+            components = original_parts[1:]
+        else:
+            base = working_directory
+            components = original_parts
+
+        if not components:
+            return None
+
+        suggested_components: list[str] = []
+        corrected: tuple[int, str, str, int, str] | None = None
+
+        for component_index, component in enumerate(components):
+            is_last = component_index == len(components) - 1
+            exact_path = base / component
+            if safe_path_exists(exact_path) and (is_last or safe_is_directory(exact_path)):
+                suggested_components.append(component)
+                base = exact_path
+                continue
+
+            if corrected is not None or not safe_is_directory(base):
+                return None
+
+            ranked: list[tuple[int, str, str, str, Path, str]] = []
+            try:
+                with os.scandir(base) as directory_entries:
+                    entries = sorted(
+                        directory_entries,
+                        key=lambda entry: (entry.name.casefold(), entry.name),
+                    )
+            except (OSError, ValueError):
+                return None
+
+            for entry in entries:
+                try:
+                    if is_last:
+                        if not (entry.is_file() or entry.is_dir()):
+                            continue
+                    elif not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+
+                score, reason = similarity_score(component, entry.name)
+                if score < MINIMUM_MATCH_SCORE:
+                    continue
+                ranked.append(
+                    (
+                        -score,
+                        entry.name.casefold(),
+                        entry.name,
+                        str(entry.path).casefold(),
+                        Path(entry.path),
+                        reason,
+                    )
+                )
+
+            if not ranked:
+                return None
+
+            ranked.sort(key=lambda item: item[:4])
+            negative_score, _, candidate_name, _, candidate_path, reason = ranked[0]
+            score = -negative_score
+            corrected = (component_index, component, candidate_name, score, reason)
+            suggested_components.append(candidate_name)
+            base = candidate_path
+
+        if corrected is None or not safe_path_exists(base):
+            return None
+
+        component_index, original_component, suggested_component, score, reason = corrected
+        if original_path.is_absolute():
+            rebuilt = Path(original_path.anchor, *suggested_components)
+        else:
+            rebuilt = Path(*suggested_components)
+        suggested_token = restore_path_style(token, rebuilt)
+
+        if component_index < len(components) - 1:
+            category = "directory path component"
+        elif safe_is_directory(base):
+            category = "directory path"
+        else:
+            category = "file path"
+
+        try:
+            resolved_path = str(base.resolve(strict=True))
+        except (OSError, ValueError):
+            resolved_path = str(base)
+
+        return PathCorrection(
+            token_index=token_index,
+            original_token=token,
+            suggested_token=suggested_token,
+            original_component=original_component,
+            suggested_component=suggested_component,
+            category=category,
+            score=score,
+            label=match_label(score),
+            reason=reason,
+            evidence=f"{suggested_token!r} exists on the local filesystem",
+            resolved_path=resolved_path,
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def inspect_path_arguments(
+    argv: list[str] | tuple[str, ...],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> tuple[tuple[PathCorrection, ...], tuple[tuple[int, str], ...]]:
+    """Inspect path-like arguments without changing or executing them."""
+
+    working_directory = Path.cwd() if cwd is None else Path(cwd)
+    corrections: list[PathCorrection] = []
+    unresolved: list[tuple[int, str]] = []
+
+    for token_index, raw_token in enumerate(argv[1:], start=1):
+        token = str(raw_token)
+        if not looks_like_path(token, working_directory):
+            continue
+        if safe_path_exists(local_path(token, working_directory)):
+            continue
+
+        correction = find_path_correction(token, token_index, cwd=working_directory)
+        if correction is None:
+            unresolved.append((token_index, token))
+        else:
+            corrections.append(correction)
+
+    return tuple(corrections), tuple(unresolved)
+
+
 def display_token(token: str) -> str:
     """Render one argument unambiguously for display only."""
 
@@ -320,26 +564,70 @@ def display_argv(argv: tuple[str, ...] | list[str]) -> str:
     return " ".join(display_token(token) for token in argv)
 
 
-def render_correction(correction: Correction) -> str:
-    """Render a concise proof-backed correction."""
+def render_command_corrections(
+    argv: list[str] | tuple[str, ...],
+    executable_correction: Correction | None,
+    path_corrections: tuple[PathCorrection, ...],
+    *,
+    unresolved: tuple[str, ...] = (),
+) -> str:
+    """Render executable and path corrections as one auditable suggestion."""
 
-    return "\n".join(
-        (
-            "Original:",
-            f"  {display_argv(correction.original_argv)}",
-            "",
-            "Suggestion:",
-            f"  {display_argv(correction.suggested_argv)}",
-            "",
-            "Evidence:",
-            f"  - {correction.evidence}",
-            f"  - Resolved path: {correction.executable_path}",
-            f"  - Reason: {correction.reason}",
-            f"  - Match: {correction.score}/100 ({correction.label.value})",
-            "",
-            "Nothing was executed.",
+    original = tuple(str(token) for token in argv)
+    suggested = list(original)
+    evidence: list[str] = []
+
+    if executable_correction is not None:
+        suggested[0] = executable_correction.suggested_token
+        evidence.extend(
+            (
+                "  - Token 0 (executable): "
+                f"{executable_correction.original_token} -> "
+                f"{executable_correction.suggested_token}",
+                f"    Source: {executable_correction.evidence}",
+                f"    Resolved path: {executable_correction.executable_path}",
+                f"    Reason: {executable_correction.reason}",
+                "    Match: "
+                f"{executable_correction.score}/100 "
+                f"({executable_correction.label.value})",
+            )
         )
-    )
+
+    for correction in path_corrections:
+        suggested[correction.token_index] = correction.suggested_token
+        evidence.extend(
+            (
+                f"  - Token {correction.token_index} ({correction.category}): "
+                f"{correction.original_token} -> {correction.suggested_token}",
+                f"    Source: {correction.evidence}",
+                f"    Resolved path: {correction.resolved_path}",
+                "    Corrected component: "
+                f"{correction.original_component} -> {correction.suggested_component}",
+                f"    Reason: {correction.reason}",
+                f"    Match: {correction.score}/100 ({correction.label.value})",
+            )
+        )
+
+    lines = [
+        "Original:",
+        f"  {display_argv(original)}",
+        "",
+        "Suggestion:",
+        f"  {display_argv(suggested)}",
+        "",
+        "Evidence:",
+        *evidence,
+    ]
+    if unresolved:
+        lines.extend(("", "Unresolved:", *(f"  - {item}" for item in unresolved)))
+    lines.extend(("", "Nothing was executed."))
+    return "\n".join(lines)
+
+
+def render_correction(correction: Correction) -> str:
+    """Render one executable correction through the combined renderer."""
+
+    return render_command_corrections(correction.original_argv, correction, ())
 
 
 def check_command(
@@ -347,9 +635,10 @@ def check_command(
     *,
     env: dict[str, str] | None = None,
     windows: bool | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
     output: object = sys.stdout,
 ) -> int:
-    """Inspect one command and print the Step 2 result."""
+    """Inspect executable and path tokens without executing the command."""
 
     if not argv:
         print("termfix: no command was supplied", file=sys.stderr)
@@ -357,20 +646,47 @@ def check_command(
 
     original = argv[0]
     resolved = command_exists(original, env)
-    if resolved is not None:
-        print(f"Command exists: {original}", file=output)
-        print(f"Resolved executable: {resolved}", file=output)
-        print("No correction is required. Nothing was executed.", file=output)
-        return EXIT_OK
+    executable_correction = None
+    if resolved is None:
+        executable_correction = find_correction(argv, env, windows=windows)
 
-    correction = find_correction(argv, env, windows=windows)
-    if correction is None:
+    path_corrections, unresolved_paths = inspect_path_arguments(argv, cwd=cwd)
+    if executable_correction is not None or path_corrections:
+        unresolved_messages = []
+        if resolved is None and executable_correction is None:
+            unresolved_messages.append(
+                f"Executable {original!r} was not found and has no reliable correction."
+            )
+        unresolved_messages.extend(
+            f"Path token {index} {token!r} was not found and has no reliable correction."
+            for index, token in unresolved_paths
+        )
+        print(
+            render_command_corrections(
+                argv,
+                executable_correction,
+                path_corrections,
+                unresolved=tuple(unresolved_messages),
+            ),
+            file=output,
+        )
+        return EXIT_CORRECTION
+
+    if resolved is None:
         print(f"Executable not found: {original}", file=output)
         print("No reliable correction found. Nothing was executed.", file=output)
         return EXIT_NOT_FOUND
 
-    print(render_correction(correction), file=output)
-    return EXIT_CORRECTION
+    if unresolved_paths:
+        for index, token in unresolved_paths:
+            print(f"Path not found at token {index}: {token}", file=output)
+        print("No reliable path correction found. Nothing was executed.", file=output)
+        return EXIT_NOT_FOUND
+
+    print(f"Command exists: {original}", file=output)
+    print(f"Resolved executable: {resolved}", file=output)
+    print("No correction is required. Nothing was executed.", file=output)
+    return EXIT_OK
 
 
 def strip_separator(command: list[str]) -> list[str]:
@@ -380,11 +696,14 @@ def strip_separator(command: list[str]) -> list[str]:
 
 
 def make_parser() -> argparse.ArgumentParser:
-    """Create the Step 2 command-line parser."""
+    """Create the TermFix command-line parser."""
 
     parser = argparse.ArgumentParser(
         prog="termfix.py",
-        description="Proof-backed executable correction using only Python's standard library.",
+        description=(
+            "Proof-backed executable and path correction using only "
+            "Python's standard library."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     actions = parser.add_subparsers(dest="action", required=True)
@@ -392,20 +711,20 @@ def make_parser() -> argparse.ArgumentParser:
     check = actions.add_parser("check", help="inspect a command without executing it")
     check.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
-    actions.add_parser("self-test", help="run the embedded Step 2 tests")
+    actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
 
 
 def run_tests() -> int:
     """Run the embedded test suite without third-party tooling."""
 
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TermFixStep2Tests)
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TermFixTests)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return EXIT_OK if result.wasSuccessful() else EXIT_NOT_FOUND
 
 
 def cli(argv: list[str] | None = None) -> int:
-    """Run the TermFix Step 2 CLI."""
+    """Run the TermFix CLI."""
 
     args = make_parser().parse_args(sys.argv[1:] if argv is None else argv)
     if args.action == "self-test":
@@ -415,8 +734,8 @@ def cli(argv: list[str] | None = None) -> int:
     return EXIT_USAGE
 
 
-class TermFixStep2Tests(unittest.TestCase):
-    """Acceptance and unit tests for proof-backed executable correction."""
+class TermFixTests(unittest.TestCase):
+    """Acceptance and unit tests for proof-backed local correction."""
 
     def test_adjacent_transposition(self) -> None:
         self.assertTrue(adjacent_transposition("pyhton", "python"))
@@ -551,8 +870,14 @@ class TermFixStep2Tests(unittest.TestCase):
 
     def test_existing_command_returns_zero(self) -> None:
         output = self._output()
-        with mock.patch(__name__ + ".command_exists", return_value="C:/Python/python.exe"):
-            code = check_command(["python", "app.py"], output=output)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "app.py").write_text("", encoding="utf-8")
+            with mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ):
+                code = check_command(["python", "app.py"], cwd=root, output=output)
         self.assertEqual(code, EXIT_OK)
         self.assertIn("No correction is required", output.getvalue())
 
@@ -578,7 +903,176 @@ class TermFixStep2Tests(unittest.TestCase):
         self.assertEqual(code, EXIT_NOT_FOUND)
         self.assertIn("No reliable correction found", output.getvalue())
 
-    def test_step_two_has_no_execution_module(self) -> None:
+    def test_misspelled_file_is_corrected_from_current_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            expected = root / "main.py"
+            expected.write_text("print('safe')", encoding="utf-8")
+            correction = find_path_correction("mian.py", 1, cwd=root)
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested_token, "main.py")
+        self.assertEqual(correction.category, "file path")
+        self.assertEqual(correction.score, 92)
+        self.assertEqual(Path(correction.resolved_path), expected)
+
+    def test_nested_file_is_corrected_and_forward_slashes_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "src"
+            source.mkdir()
+            (source / "main.py").write_text("", encoding="utf-8")
+            correction = find_path_correction("src/mian.py", 1, cwd=root)
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested_token, "src/main.py")
+
+    def test_misspelled_directory_component_is_corrected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "src"
+            source.mkdir()
+            (source / "main.py").write_text("", encoding="utf-8")
+            correction = find_path_correction("scr/main.py", 1, cwd=root)
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested_token, "src/main.py")
+        self.assertEqual(correction.category, "directory path component")
+        self.assertEqual(correction.original_component, "scr")
+        self.assertEqual(correction.suggested_component, "src")
+
+    def test_directory_argument_is_corrected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "docs").mkdir()
+            correction = find_path_correction("docz/", 1, cwd=root)
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested_token, "docs/")
+        self.assertEqual(correction.category, "directory path")
+
+    def test_file_extension_typo_is_corrected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "main.py").write_text("", encoding="utf-8")
+            correction = find_path_correction("main.pye", 1, cwd=root)
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested_token, "main.py")
+
+    def test_unrelated_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "main.py").write_text("", encoding="utf-8")
+            correction = find_path_correction(
+                "completely-unrelated.txt",
+                1,
+                cwd=root,
+            )
+
+        self.assertIsNone(correction)
+
+    def test_two_misspelled_path_components_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "src"
+            source.mkdir()
+            (source / "main.py").write_text("", encoding="utf-8")
+            correction = find_path_correction("scr/mian.py", 1, cwd=root)
+
+        self.assertIsNone(correction)
+
+    def test_path_candidate_ordering_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "cutx.py").write_text("", encoding="utf-8")
+            (root / "catx.py").write_text("", encoding="utf-8")
+            first = find_path_correction("cotx.py", 1, cwd=root)
+            second = find_path_correction("cotx.py", 1, cwd=root)
+
+        self.assertEqual(first, second)
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertEqual(first.suggested_token, "catx.py")
+
+    def test_options_urls_and_globs_are_not_treated_as_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for token in ("--config=main.py", "https://example.com/a.py", "*.py"):
+                self.assertFalse(looks_like_path(token, root))
+
+    def test_missing_path_directory_does_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            correction = find_path_correction("missing/mian.py", 1, cwd=root)
+        self.assertIsNone(correction)
+
+    def test_path_correction_preserves_all_other_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "main.py").write_text("", encoding="utf-8")
+            argv = ["python", "mian.py", "--verbose", "value with spaces"]
+            corrections, unresolved = inspect_path_arguments(argv, cwd=root)
+            rendered = render_command_corrections(argv, None, corrections)
+
+        self.assertEqual(unresolved, ())
+        self.assertEqual(len(corrections), 1)
+        self.assertIn('python main.py --verbose "value with spaces"', rendered)
+
+    def test_path_correction_returns_three_and_proves_resolved_path(self) -> None:
+        output = self._output()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            expected = root / "main.py"
+            expected.write_text("unchanged", encoding="utf-8")
+            with mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ):
+                code = check_command(["python", "mian.py"], cwd=root, output=output)
+            content_after_check = expected.read_text(encoding="utf-8")
+
+        self.assertEqual(code, EXIT_CORRECTION)
+        self.assertEqual(content_after_check, "unchanged")
+        self.assertIn("python main.py", output.getvalue())
+        self.assertIn(str(expected), output.getvalue())
+        self.assertIn("Nothing was executed", output.getvalue())
+
+    def test_existing_path_does_not_produce_a_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "main.py").write_text("", encoding="utf-8")
+            corrections, unresolved = inspect_path_arguments(
+                ["python", "main.py"],
+                cwd=root,
+            )
+
+        self.assertEqual(corrections, ())
+        self.assertEqual(unresolved, ())
+
+    def test_missing_path_without_match_returns_one(self) -> None:
+        output = self._output()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ):
+                code = check_command(
+                    ["python", "unrelated-file.py"],
+                    cwd=root,
+                    output=output,
+                )
+
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertIn("No reliable path correction found", output.getvalue())
+
+    def test_check_has_no_execution_module(self) -> None:
         self.assertNotIn("subprocess", globals())
 
     @staticmethod
