@@ -8,8 +8,9 @@ The repository currently contains:
 - **Step 3:** correct file and directory arguments using real entries from the relevant local directory.
 - **Step 4:** recognize useful stderr patterns and derive corrections from explicit program evidence.
 - **Step 5:** classify command risk with deterministic rules before any future execution is considered.
+- **Step 6:** run approved commands with `shell=False`, capture failures and offer one safe corrected retry.
 
-Every suggestion carries local evidence. TermFix never executes the inspected command.
+Every suggestion carries local evidence. `check` and `safety` never execute the inspected command.
 
 ## Try it
 
@@ -34,6 +35,26 @@ Classify a command without running it:
 ```powershell
 python termfix.py safety -- git reset --hard
 ```
+
+Run a valid command through the guarded executor:
+
+```powershell
+python termfix.py run -- python --version
+```
+
+Try a corrected run in an interactive terminal:
+
+```powershell
+python termfix.py run -- pyhton --version
+```
+
+TermFix displays the suggestion and waits for one of these choices:
+
+```text
+[y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel
+```
+
+Only `y` or `yes` approves a corrected command. Enter, `n`, EOF and non-interactive input cancel. `e` displays correction evidence and `d` displays the changed token positions. An unchanged command may run immediately because choosing the `run` action already expresses intent; all Step 5 execution blocks still apply.
 
 Step 5 labels commands as:
 
@@ -63,25 +84,29 @@ python -I -S termfix.py self-test
 - Safety rules recognize deletion, formatting, shutdown/reboot, disk-management, destructive Git operations, force/recursive flags, shell operators, overwrite redirection and broad/device targets.
 - Every safety label includes the exact rules and evidence that produced it.
 - Corrections that would increase the conservative risk level are blocked.
+- Corrected execution always requires explicit `y` approval; Enter cancels.
+- Child processes receive an argument list and `shell=False` is always enforced.
+- High-risk operations, complex shell operators and explicit shell-command strings are blocked by `run`.
+- Failed commands may receive one stderr-backed corrected retry, which requires a new approval.
 - Weak matches are rejected.
 - Tokens that do not require correction stay unchanged.
 - Candidate ranking is deterministic.
-- `check` contains no command-execution pathway.
+- `check` and `safety` cannot call the executor.
 
-Steps 2-5 do not execute commands, rename files, edit source code or completely parse PowerShell/Bash syntax. Step 4 analyzes error text supplied with `--error-text`; automatic execution and stderr capture are not implemented yet. A Low label is conservative evidence, not a guarantee or automatic approval.
+Only the explicit `run` action can launch a child process. Steps 2-5 remain read-only. TermFix does not rename files, edit source code or completely parse PowerShell/Bash syntax. A Low label is conservative evidence, not a guarantee. Because `run` enforces `shell=False`, shell built-ins such as PowerShell aliases or CMD-only commands are not treated as standalone executables. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added.
 
 ## Exit codes
 
 | Code | Meaning |
 |---:|---|
 | `0` | Successful read-only check/classification; no correction required |
-| `1` | No reliable executable, path or error-based correction found |
+| `1` | Wrapped command failed, launch failed or no reliable correction was found |
 | `2` | Invalid CLI usage |
 | `3` | Reliable correction available |
 | `4` | User cancelled or interrupted the operation |
 | `5` | Safety blocked a high-risk command or risk-increasing correction |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-5 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-6 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.

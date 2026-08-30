@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-5: proof-backed correction and safety classification.
+"""TermFix Steps 2-6: proof-backed correction and guarded command execution.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
 patterns. Safety decisions come from conservative, deterministic command rules.
-Every result carries evidence, and the inspected command is never executed.
+The check and safety actions never execute commands. The run action uses an
+argument vector with shell=False and requires explicit approval for corrections.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,7 +27,7 @@ from unittest import mock
 
 
 APP_NAME = "TermFix"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -161,6 +163,48 @@ class SafetyAssessment:
     @property
     def blocked(self) -> bool:
         return self.level is RiskLevel.HIGH
+
+
+@dataclass(frozen=True)
+class PreflightAnalysis:
+    """Structured correction and safety evidence prepared before execution."""
+
+    original_argv: tuple[str, ...]
+    suggested_argv: tuple[str, ...]
+    resolved_executable: str | None
+    executable_correction: Correction | None
+    path_corrections: tuple[PathCorrection, ...]
+    unresolved_paths: tuple[tuple[int, str], ...]
+    original_safety: SafetyAssessment
+    suggested_safety: SafetyAssessment
+    risk_increased: bool
+
+    @property
+    def has_correction(self) -> bool:
+        return self.original_argv != self.suggested_argv
+
+    @property
+    def correction_count(self) -> int:
+        return int(self.executable_correction is not None) + len(self.path_corrections)
+
+    @property
+    def match_label(self) -> MatchLabel | None:
+        labels = [correction.label for correction in self.path_corrections]
+        if self.executable_correction is not None:
+            labels.append(self.executable_correction.label)
+        if not labels:
+            return None
+        return MatchLabel.MEDIUM if MatchLabel.MEDIUM in labels else MatchLabel.HIGH
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    """Captured result of one shell-free child-process attempt."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    launch_error: str | None = None
 
 
 def selected_environment(env: dict[str, str] | None) -> dict[str, str]:
@@ -1123,6 +1167,12 @@ RECURSIVE_FLAGS = {
     "/s",
 }
 
+EXECUTION_BLOCKING_RULES = {
+    "append-redirection",
+    "compound-shell-syntax",
+    "shell-command-text",
+}
+
 GIT_READ_ONLY_SUBCOMMANDS = {
     "diff",
     "grep",
@@ -1615,6 +1665,22 @@ def correction_preserves_risk(
     return allowed, original, suggested
 
 
+def execution_blocking_findings(
+    assessment: SafetyAssessment,
+) -> tuple[SafetyFinding, ...]:
+    """Return findings that forbid execution even when risk is not High."""
+
+    return tuple(
+        finding
+        for finding in assessment.findings
+        if finding.level is RiskLevel.HIGH
+        or any(
+            finding.rule == rule or finding.rule.endswith("-" + rule)
+            for rule in EXECUTION_BLOCKING_RULES
+        )
+    )
+
+
 def display_token(token: str) -> str:
     """Render one argument unambiguously for display only."""
 
@@ -1629,7 +1695,11 @@ def display_argv(argv: tuple[str, ...] | list[str]) -> str:
     return " ".join(display_token(token) for token in argv)
 
 
-def render_safety_assessment(assessment: SafetyAssessment) -> str:
+def render_safety_assessment(
+    assessment: SafetyAssessment,
+    *,
+    footer: str = "Nothing was executed.",
+) -> str:
     """Render a safety label and the exact deterministic evidence behind it."""
 
     decision = (
@@ -1653,7 +1723,7 @@ def render_safety_assessment(assessment: SafetyAssessment) -> str:
     lines.extend(
         (
             "  Note: a Low label is conservative evidence, not a guarantee.",
-            "Nothing was executed.",
+            footer,
         )
     )
     return "\n".join(lines)
@@ -1701,9 +1771,174 @@ def corrected_argv(
     return tuple(suggested)
 
 
+def prepare_preflight(
+    argv: list[str] | tuple[str, ...],
+    *,
+    env: dict[str, str] | None = None,
+    windows: bool | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> PreflightAnalysis:
+    """Prepare proof-backed corrections and safety evidence without execution."""
+
+    original = tuple(str(token) for token in argv)
+    resolved = command_exists(original[0], env) if original else None
+    executable_correction = None
+    if original and resolved is None:
+        executable_correction = find_correction(original, env, windows=windows)
+    path_corrections, unresolved_paths = inspect_path_arguments(original, cwd=cwd)
+    suggestion = corrected_argv(original, executable_correction, path_corrections)
+    original_safety = assess_command_safety(original)
+    suggested_safety = assess_command_safety(suggestion)
+    risk_increased = (
+        RISK_PRIORITY[suggested_safety.level]
+        > RISK_PRIORITY[original_safety.level]
+    )
+    return PreflightAnalysis(
+        original_argv=original,
+        suggested_argv=suggestion,
+        resolved_executable=resolved,
+        executable_correction=executable_correction,
+        path_corrections=path_corrections,
+        unresolved_paths=unresolved_paths,
+        original_safety=original_safety,
+        suggested_safety=suggested_safety,
+        risk_increased=risk_increased,
+    )
+
+
+def render_compact_correction(
+    original: tuple[str, ...] | list[str],
+    suggested: tuple[str, ...] | list[str],
+    *,
+    correction_count: int,
+    label: MatchLabel,
+    safety: SafetyAssessment,
+) -> str:
+    """Render the small approval view used before corrected execution."""
+
+    noun = "correction" if correction_count == 1 else "corrections"
+    return "\n".join(
+        (
+            "Original:",
+            f"  {display_argv(sanitized_argv(original))}",
+            "",
+            "Suggestion:",
+            f"  {display_argv(sanitized_argv(suggested))}  [i]",
+            "",
+            f"{correction_count} {noun} | Match: {label.value} | "
+            f"Risk: {safety.level.value}",
+        )
+    )
+
+
+def render_token_diff(
+    original: tuple[str, ...] | list[str],
+    suggested: tuple[str, ...] | list[str],
+) -> str:
+    """Render changed argument positions without constructing shell text."""
+
+    safe_original = sanitized_argv(original)
+    safe_suggested = sanitized_argv(suggested)
+    lines = ["Token diff:"]
+    width = max(len(safe_original), len(safe_suggested))
+    changes = 0
+    for index in range(width):
+        before = safe_original[index] if index < len(safe_original) else "(missing)"
+        after = safe_suggested[index] if index < len(safe_suggested) else "(missing)"
+        if before != after:
+            lines.append(
+                f"  [{index}] {display_token(before)} -> {display_token(after)}"
+            )
+            changes += 1
+    if changes == 0:
+        lines.append("  No token changes.")
+    return "\n".join(lines)
+
+
+def render_execution_block(
+    assessment: SafetyAssessment,
+    blockers: tuple[SafetyFinding, ...],
+) -> str:
+    """Render exact reasons why the run action refused a command."""
+
+    lines = [
+        "Execution blocked:",
+        f"  Risk: {assessment.level.value}",
+        "  Blocking evidence:",
+    ]
+    for finding in blockers:
+        lines.extend(
+            (
+                f"    - [{finding.rule}] {finding.reason}",
+                f"      Evidence: {finding.evidence}",
+            )
+        )
+    lines.append("Nothing was executed.")
+    return "\n".join(lines)
+
+
+def request_correction_approval(
+    original: tuple[str, ...] | list[str],
+    suggested: tuple[str, ...] | list[str],
+    *,
+    correction_count: int,
+    label: MatchLabel,
+    safety: SafetyAssessment,
+    explanation: str,
+    input_fn: object | None = None,
+    interactive: bool | None = None,
+    output: object = sys.stdout,
+) -> bool:
+    """Require an explicit y while offering explanation and token diff views."""
+
+    print(
+        render_compact_correction(
+            original,
+            suggested,
+            correction_count=correction_count,
+            label=label,
+            safety=safety,
+        ),
+        file=output,
+    )
+    can_prompt = (
+        input_fn is not None or sys.stdin.isatty()
+        if interactive is None
+        else interactive
+    )
+    if not can_prompt:
+        print("Cancelled: interactive approval is required.", file=output)
+        return False
+
+    reader = input if input_fn is None else input_fn
+    while True:
+        print("", file=output)
+        print("[y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel", file=output)
+        try:
+            choice = reader("Choice: ").strip().casefold()
+        except EOFError:
+            choice = ""
+        if choice in {"y", "yes"}:
+            return True
+        if choice in {"", "n", "no"}:
+            print("Cancelled. Nothing was executed.", file=output)
+            return False
+        if choice in {"e", "explain"}:
+            print("", file=output)
+            print(explanation, file=output)
+            continue
+        if choice in {"d", "diff"}:
+            print("", file=output)
+            print(render_token_diff(original, suggested), file=output)
+            continue
+        print("Choose y, e, d, n, or press Enter to cancel.", file=output)
+
+
 def render_error_analysis(
     analysis: ErrorAnalysis,
     argv: list[str] | tuple[str, ...],
+    *,
+    footer: str = "Nothing was executed.",
 ) -> str:
     """Render sanitized error evidence without repeating the raw stderr text."""
 
@@ -1736,7 +1971,7 @@ def render_error_analysis(
     else:
         lines.extend(("", "No reliable correction found."))
 
-    lines.extend(("", "Raw stderr was not repeated.", "Nothing was executed."))
+    lines.extend(("", "Raw stderr was not repeated.", footer))
     return "\n".join(lines)
 
 
@@ -1784,12 +2019,14 @@ def render_command_corrections(
             )
         )
 
+    display_original = sanitized_argv(original)
+    display_suggested = sanitized_argv(suggested)
     lines = [
         "Original:",
-        f"  {display_argv(original)}",
+        f"  {display_argv(display_original)}",
         "",
         "Suggestion:",
-        f"  {display_argv(suggested)}",
+        f"  {display_argv(display_suggested)}",
         "",
         "Evidence:",
         *evidence,
@@ -1944,6 +2181,254 @@ def safety_command(
     return EXIT_BLOCKED if assessment.blocked else EXIT_OK
 
 
+def execute_command(
+    argv: tuple[str, ...] | list[str],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    env: dict[str, str] | None = None,
+    runner: object | None = None,
+) -> ExecutionResult:
+    """Execute one argument vector with shell=False and capture its output."""
+
+    active_runner = subprocess.run if runner is None else runner
+    try:
+        completed = active_runner(
+            list(argv),
+            shell=False,
+            cwd=None if cwd is None else str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+    except (FileNotFoundError, PermissionError) as error:
+        filename = sanitized_error_token(getattr(error, "filename", None))
+        detail = filename or "the executable could not be launched"
+        message = f"{type(error).__name__}: {detail}"
+        return ExecutionResult(1, "", "", message)
+    except OSError as error:
+        detail = f"OS error {error.errno}" if error.errno is not None else "OS error"
+        return ExecutionResult(1, "", "", f"{type(error).__name__}: {detail}")
+
+    stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+    stderr = completed.stderr if isinstance(completed.stderr, str) else ""
+    return ExecutionResult(int(completed.returncode), stdout, stderr)
+
+
+def emit_captured_output(
+    result: ExecutionResult,
+    *,
+    output: object,
+    error_output: object,
+) -> None:
+    """Forward captured child output once, preserving its stream."""
+
+    if result.stdout:
+        print(
+            result.stdout,
+            end="" if result.stdout.endswith("\n") else "\n",
+            file=output,
+        )
+    if result.stderr:
+        print(
+            result.stderr,
+            end="" if result.stderr.endswith("\n") else "\n",
+            file=error_output,
+        )
+
+
+def run_command(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    windows: bool | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    input_fn: object | None = None,
+    interactive: bool | None = None,
+    runner: object | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Preflight, optionally approve, and execute one shell-free command."""
+
+    if not argv:
+        print("termfix: no command was supplied", file=error_output)
+        return EXIT_USAGE
+
+    preflight = prepare_preflight(
+        argv,
+        env=env,
+        windows=windows,
+        cwd=cwd,
+    )
+    if preflight.risk_increased:
+        print(
+            render_blocked_correction(
+                preflight.original_safety,
+                preflight.suggested_safety,
+            ),
+            file=output,
+        )
+        return EXIT_BLOCKED
+
+    blockers = execution_blocking_findings(preflight.suggested_safety)
+    if blockers:
+        print(
+            render_execution_block(preflight.suggested_safety, blockers),
+            file=output,
+        )
+        return EXIT_BLOCKED
+
+    if (
+        preflight.resolved_executable is None
+        and preflight.executable_correction is None
+    ):
+        print(f"Executable not found: {preflight.original_argv[0]}", file=error_output)
+        print("No reliable correction found. Nothing was executed.", file=output)
+        return EXIT_NOT_FOUND
+
+    if preflight.unresolved_paths:
+        for index, token in preflight.unresolved_paths:
+            print(f"Path not found at token {index}: {token}", file=error_output)
+        print(
+            "Run cancelled because a path could not be proven or corrected. "
+            "Nothing was executed.",
+            file=output,
+        )
+        return EXIT_NOT_FOUND
+
+    command_to_run = preflight.suggested_argv
+    if preflight.has_correction:
+        assert preflight.match_label is not None
+        explanation = "\n\n".join(
+            (
+                render_command_corrections(
+                    preflight.original_argv,
+                    preflight.executable_correction,
+                    preflight.path_corrections,
+                ),
+                render_safety_assessment(preflight.suggested_safety),
+            )
+        )
+        approved = request_correction_approval(
+            preflight.original_argv,
+            preflight.suggested_argv,
+            correction_count=preflight.correction_count,
+            label=preflight.match_label,
+            safety=preflight.suggested_safety,
+            explanation=explanation,
+            input_fn=input_fn,
+            interactive=interactive,
+            output=output,
+        )
+        if not approved:
+            return EXIT_CANCELLED
+
+    result = execute_command(
+        command_to_run,
+        cwd=cwd,
+        env=env,
+        runner=runner,
+    )
+    emit_captured_output(result, output=output, error_output=error_output)
+    if result.launch_error is not None:
+        print(f"termfix: launch failed: {result.launch_error}", file=error_output)
+        return EXIT_NOT_FOUND
+    if result.returncode == 0:
+        return EXIT_OK
+
+    print(
+        f"TermFix: command failed with exit code {result.returncode}.",
+        file=error_output,
+    )
+    error_sample = result.stderr[-65536:]
+    if not error_sample.strip():
+        print("No stderr evidence was available for correction.", file=output)
+        return EXIT_NOT_FOUND
+    analysis = analyze_error_message(
+        error_sample,
+        command_to_run,
+        env=env,
+        windows=windows,
+        cwd=cwd,
+    )
+    if (
+        not analysis.has_correction
+        or analysis.token_index is None
+        or analysis.suggestion is None
+        or analysis.token_index >= len(command_to_run)
+    ):
+        print(
+            f"No reliable post-failure correction found ({analysis.category.value}).",
+            file=output,
+        )
+        return EXIT_NOT_FOUND
+
+    retry_argv = list(command_to_run)
+    retry_argv[analysis.token_index] = analysis.suggestion
+    allowed, original_safety, retry_safety = correction_preserves_risk(
+        command_to_run,
+        retry_argv,
+    )
+    if not allowed:
+        print(render_blocked_correction(original_safety, retry_safety), file=output)
+        return EXIT_BLOCKED
+    retry_blockers = execution_blocking_findings(retry_safety)
+    if retry_blockers:
+        print(render_execution_block(retry_safety, retry_blockers), file=output)
+        return EXIT_BLOCKED
+
+    retry_label = analysis.label or MatchLabel.MEDIUM
+    retry_explanation = "\n\n".join(
+        (
+            render_error_analysis(
+                analysis,
+                command_to_run,
+                footer="No retry was executed during analysis.",
+            ),
+            render_safety_assessment(
+                retry_safety,
+                footer="No retry was executed during safety review.",
+            ),
+        )
+    )
+    approved = request_correction_approval(
+        command_to_run,
+        retry_argv,
+        correction_count=1,
+        label=retry_label,
+        safety=retry_safety,
+        explanation=retry_explanation,
+        input_fn=input_fn,
+        interactive=interactive,
+        output=output,
+    )
+    if not approved:
+        return EXIT_CANCELLED
+
+    retry_result = execute_command(
+        retry_argv,
+        cwd=cwd,
+        env=env,
+        runner=runner,
+    )
+    emit_captured_output(retry_result, output=output, error_output=error_output)
+    if retry_result.launch_error is not None:
+        print(
+            f"termfix: corrected launch failed: {retry_result.launch_error}",
+            file=error_output,
+        )
+        return EXIT_NOT_FOUND
+    if retry_result.returncode == 0:
+        return EXIT_OK
+    print(
+        f"TermFix: corrected command failed with exit code {retry_result.returncode}.",
+        file=error_output,
+    )
+    return EXIT_NOT_FOUND
+
+
 def strip_separator(command: list[str]) -> list[str]:
     """Remove a literal argparse remainder separator when present."""
 
@@ -1956,8 +2441,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="termfix.py",
         description=(
-            "Proof-backed command correction and deterministic safety "
-            "classification using only Python's standard library."
+            "Proof-backed command correction, deterministic safety, and "
+            "guarded shell-free execution using only Python's standard library."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1976,6 +2461,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="classify command risk without executing it",
     )
     safety.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
+
+    run = actions.add_parser(
+        "run",
+        help="preflight and safely run a command",
+    )
+    run.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
     actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
@@ -2002,6 +2493,8 @@ def cli(argv: list[str] | None = None) -> int:
         )
     if args.action == "safety":
         return safety_command(strip_separator(args.command))
+    if args.action == "run":
+        return run_command(strip_separator(args.command))
     return EXIT_USAGE
 
 
@@ -2801,8 +3294,481 @@ class TermFixTests(unittest.TestCase):
         self.assertEqual(code, EXIT_CANCELLED)
         self.assertIn("cancelled", error_output.getvalue())
 
-    def test_check_has_no_execution_module(self) -> None:
-        self.assertNotIn("subprocess", globals())
+    def test_check_and_safety_never_call_executor(self) -> None:
+        check_output = self._output()
+        safety_output = self._output()
+        with (
+            mock.patch(__name__ + ".execute_command") as executor,
+            mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ),
+        ):
+            check_code = check_command(
+                ["python", "--version"],
+                output=check_output,
+            )
+            safety_code = safety_command(
+                ["python", "--version"],
+                output=safety_output,
+            )
+
+        self.assertEqual(check_code, EXIT_OK)
+        self.assertEqual(safety_code, EXIT_OK)
+        executor.assert_not_called()
+
+    def test_execute_command_uses_argument_list_and_shell_false(self) -> None:
+        runner = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                ["tool", "value with spaces"],
+                0,
+                stdout="done\n",
+                stderr="",
+            )
+        )
+
+        result = execute_command(["tool", "value with spaces"], runner=runner)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "done\n")
+        positional, keywords = runner.call_args
+        self.assertEqual(positional[0], ["tool", "value with spaces"])
+        self.assertIs(keywords["shell"], False)
+        self.assertIs(keywords["capture_output"], True)
+        self.assertIs(keywords["check"], False)
+
+    def test_execute_command_handles_expected_launch_error(self) -> None:
+        runner = mock.Mock(
+            side_effect=FileNotFoundError(2, "not found", "missing-tool")
+        )
+
+        result = execute_command(["missing-tool"], runner=runner)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FileNotFoundError", result.launch_error or "")
+        self.assertNotIn("not found", result.launch_error or "")
+
+    def test_run_executes_valid_original_without_correction(self) -> None:
+        runner = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                ["echo", "hello"],
+                0,
+                stdout="hello\n",
+                stderr="",
+            )
+        )
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Windows/System32/echo.exe",
+        ):
+            code = run_command(
+                ["echo", "hello"],
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(runner.call_count, 1)
+        self.assertIn("hello", output.getvalue())
+
+    def test_run_without_command_returns_usage(self) -> None:
+        runner = mock.Mock()
+
+        code = run_command(
+            [],
+            runner=runner,
+            output=self._output(),
+            error_output=self._output(),
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+        runner.assert_not_called()
+
+    def test_run_refuses_unresolved_path_without_execution(self) -> None:
+        runner = mock.Mock()
+        output = self._output()
+        errors = self._output()
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ),
+        ):
+            code = run_command(
+                ["python", "missing-script.py"],
+                cwd=folder,
+                runner=runner,
+                output=output,
+                error_output=errors,
+            )
+
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        runner.assert_not_called()
+        self.assertIn("could not be proven or corrected", output.getvalue())
+        self.assertIn("missing-script.py", errors.getvalue())
+
+    def test_corrected_run_cancels_on_enter_without_execution(self) -> None:
+        candidate = ExecutableCandidate("python", "python.exe", "C:/Python/python.exe")
+        runner = mock.Mock()
+        output = self._output()
+        with (
+            mock.patch(__name__ + ".command_exists", return_value=None),
+            mock.patch(__name__ + ".discover_executables", return_value=(candidate,)),
+        ):
+            code = run_command(
+                ["pyhton", "--version"],
+                env={},
+                windows=True,
+                input_fn=lambda _prompt: "",
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_CANCELLED)
+        runner.assert_not_called()
+        self.assertIn("Cancelled. Nothing was executed", output.getvalue())
+
+    def test_corrected_run_requires_explicit_y_and_uses_suggestion(self) -> None:
+        candidate = ExecutableCandidate("python", "python.exe", "C:/Python/python.exe")
+        runner = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                ["python", "--version"],
+                0,
+                stdout="Python 3.13\n",
+                stderr="",
+            )
+        )
+        output = self._output()
+        with (
+            mock.patch(__name__ + ".command_exists", return_value=None),
+            mock.patch(__name__ + ".discover_executables", return_value=(candidate,)),
+        ):
+            code = run_command(
+                ["pyhton", "--version"],
+                env={},
+                windows=True,
+                input_fn=lambda _prompt: "y",
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(runner.call_args.args[0], ["python", "--version"])
+        self.assertIn("1 correction | Match: High | Risk: Low", output.getvalue())
+
+    def test_correction_prompt_supports_explain_and_diff(self) -> None:
+        candidate = ExecutableCandidate("python", "python.exe", "C:/Python/python.exe")
+        choices = iter(("e", "d", "y"))
+        runner = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                ["python", "--version"],
+                0,
+                stdout="",
+                stderr="",
+            )
+        )
+        output = self._output()
+        with (
+            mock.patch(__name__ + ".command_exists", return_value=None),
+            mock.patch(__name__ + ".discover_executables", return_value=(candidate,)),
+        ):
+            code = run_command(
+                ["pyhton", "--version"],
+                env={},
+                windows=True,
+                input_fn=lambda _prompt: next(choices),
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("Resolved path: C:/Python/python.exe", output.getvalue())
+        self.assertIn("Token diff:", output.getvalue())
+        self.assertIn("[0] pyhton -> python", output.getvalue())
+
+    def test_noninteractive_corrected_run_cancels(self) -> None:
+        candidate = ExecutableCandidate("python", "python.exe", "C:/Python/python.exe")
+        runner = mock.Mock()
+        output = self._output()
+        with (
+            mock.patch(__name__ + ".command_exists", return_value=None),
+            mock.patch(__name__ + ".discover_executables", return_value=(candidate,)),
+        ):
+            code = run_command(
+                ["pyhton", "--version"],
+                env={},
+                windows=True,
+                input_fn=lambda _prompt: "y",
+                interactive=False,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_CANCELLED)
+        runner.assert_not_called()
+        self.assertIn("interactive approval is required", output.getvalue())
+
+    def test_run_blocks_high_risk_command_without_calling_runner(self) -> None:
+        runner = mock.Mock()
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Program Files/Git/cmd/git.exe",
+        ):
+            code = run_command(
+                ["git", "reset", "--hard"],
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        runner.assert_not_called()
+        self.assertIn("git reset --hard can discard", output.getvalue())
+
+    def test_run_blocks_risk_increasing_preflight_correction(self) -> None:
+        candidate = ExecutableCandidate("rm", "rm.exe", "C:/Tools/rm.exe")
+        runner = mock.Mock()
+        output = self._output()
+        with (
+            mock.patch(__name__ + ".command_exists", return_value=None),
+            mock.patch(__name__ + ".discover_executables", return_value=(candidate,)),
+        ):
+            code = run_command(
+                ["rmm", "ordinary-name"],
+                env={},
+                windows=True,
+                input_fn=lambda _prompt: "y",
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        runner.assert_not_called()
+        self.assertIn("No runnable correction was returned", output.getvalue())
+
+    def test_run_blocks_complex_shell_operator_without_execution(self) -> None:
+        runner = mock.Mock()
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Windows/System32/echo.exe",
+        ):
+            code = run_command(
+                ["echo", "hello", "|", "other-tool"],
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        runner.assert_not_called()
+        self.assertIn("compound shell syntax", output.getvalue())
+
+    def test_run_blocks_explicit_shell_command_text(self) -> None:
+        runner = mock.Mock()
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        ):
+            code = run_command(
+                ["powershell", "-Command", "Get-Date"],
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        runner.assert_not_called()
+        self.assertIn("static token checks cannot prove safe", output.getvalue())
+
+    def test_failed_run_can_offer_one_error_based_retry(self) -> None:
+        first = subprocess.CompletedProcess(
+            ["tool", "instal"],
+            2,
+            stdout="",
+            stderr=(
+                "argument action: invalid choice: 'instal' "
+                "(choose from 'install', 'remove')"
+            ),
+        )
+        second = subprocess.CompletedProcess(
+            ["tool", "install"],
+            0,
+            stdout="installed\n",
+            stderr="",
+        )
+        runner = mock.Mock(side_effect=(first, second))
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Tools/tool.exe",
+        ):
+            code = run_command(
+                ["tool", "instal"],
+                input_fn=lambda _prompt: "y",
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(runner.call_args_list[1].args[0], ["tool", "install"])
+        self.assertIn("installed", output.getvalue())
+
+    def test_failed_run_without_reliable_correction_returns_one(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["tool"],
+            7,
+            stdout="",
+            stderr="something unusual happened",
+        )
+        runner = mock.Mock(return_value=failure)
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Tools/tool.exe",
+        ):
+            code = run_command(
+                ["tool"],
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertEqual(runner.call_count, 1)
+        self.assertIn("unknown error", output.getvalue())
+
+    def test_user_can_cancel_post_failure_retry(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["tool", "instal"],
+            2,
+            stdout="",
+            stderr=(
+                "invalid choice: 'instal' "
+                "(choose from 'install', 'remove')"
+            ),
+        )
+        runner = mock.Mock(return_value=failure)
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Tools/tool.exe",
+        ):
+            code = run_command(
+                ["tool", "instal"],
+                input_fn=lambda _prompt: "n",
+                interactive=True,
+                runner=runner,
+                output=self._output(),
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_CANCELLED)
+        self.assertEqual(runner.call_count, 1)
+
+    def test_corrected_retry_is_attempted_only_once(self) -> None:
+        first = subprocess.CompletedProcess(
+            ["tool", "instal"],
+            2,
+            stdout="",
+            stderr="invalid choice: 'instal' (choose from 'install')",
+        )
+        second = subprocess.CompletedProcess(
+            ["tool", "install"],
+            9,
+            stdout="",
+            stderr="invalid choice: 'install' (choose from 'remove')",
+        )
+        runner = mock.Mock(side_effect=(first, second))
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Tools/tool.exe",
+        ):
+            code = run_command(
+                ["tool", "instal"],
+                input_fn=lambda _prompt: "y",
+                interactive=True,
+                runner=runner,
+                output=self._output(),
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertEqual(runner.call_count, 2)
+
+    def test_failed_run_blocks_risk_increasing_retry(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["git", "clea"],
+            1,
+            stdout="",
+            stderr=(
+                "git: 'clea' is not a git command. See 'git --help'.\n\n"
+                "The most similar command is\n\tclean"
+            ),
+        )
+        runner = mock.Mock(return_value=failure)
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Program Files/Git/cmd/git.exe",
+        ):
+            code = run_command(
+                ["git", "clea"],
+                input_fn=lambda _prompt: "y",
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        self.assertEqual(runner.call_count, 1)
+        self.assertIn("Proposed risk: High", output.getvalue())
+
+    def test_compact_correction_redacts_sensitive_values(self) -> None:
+        rendered = render_compact_correction(
+            ["tool", "instal", "--token", "super-secret"],
+            ["tool", "install", "--token", "super-secret"],
+            correction_count=1,
+            label=MatchLabel.HIGH,
+            safety=assess_command_safety(["tool", "install"]),
+        )
+
+        self.assertNotIn("super-secret", rendered)
+        self.assertIn("--token <redacted>", rendered)
+
+    def test_detailed_correction_redacts_sensitive_values(self) -> None:
+        correction = Correction(
+            original_token="pyhton",
+            suggested_token="python",
+            original_arguments=("--token", "super-secret"),
+            score=92,
+            label=MatchLabel.HIGH,
+            reason="one adjacent-character transposition",
+            evidence="PATH evidence",
+            executable_path="C:/Python/python.exe",
+        )
+
+        rendered = render_correction(correction)
+
+        self.assertNotIn("super-secret", rendered)
+        self.assertIn("--token <redacted>", rendered)
 
     @staticmethod
     def _output():
