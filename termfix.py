@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-4: proof-backed command, path and error correction.
+"""TermFix Steps 2-5: proof-backed correction and safety classification.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
-patterns. Every match is deterministic, and the inspected command is never
-executed.
+patterns. Safety decisions come from conservative, deterministic command rules.
+Every result carries evidence, and the inspected command is never executed.
 """
 
 from __future__ import annotations
@@ -25,12 +25,14 @@ from unittest import mock
 
 
 APP_NAME = "TermFix"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
 EXIT_USAGE = 2
 EXIT_CORRECTION = 3
+EXIT_CANCELLED = 4
+EXIT_BLOCKED = 5
 EXIT_INTERNAL = 70
 
 MINIMUM_MATCH_SCORE = 70
@@ -55,6 +57,21 @@ class ErrorCategory(str, Enum):
     UNRECOGNIZED_ARGUMENT = "unrecognized argument"
     PERMISSION_DENIED = "permission denied"
     UNKNOWN = "unknown error"
+
+
+class RiskLevel(str, Enum):
+    """Conservative command-risk labels ordered from least to most risky."""
+
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+
+
+RISK_PRIORITY = {
+    RiskLevel.LOW: 1,
+    RiskLevel.MEDIUM: 2,
+    RiskLevel.HIGH: 3,
+}
 
 
 @dataclass(frozen=True)
@@ -122,6 +139,28 @@ class ErrorAnalysis:
     @property
     def has_correction(self) -> bool:
         return self.suggestion is not None
+
+
+@dataclass(frozen=True)
+class SafetyFinding:
+    """One deterministic rule that contributed to a safety decision."""
+
+    level: RiskLevel
+    rule: str
+    reason: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class SafetyAssessment:
+    """A read-only safety classification for an argument vector."""
+
+    level: RiskLevel
+    findings: tuple[SafetyFinding, ...]
+
+    @property
+    def blocked(self) -> bool:
+        return self.level is RiskLevel.HIGH
 
 
 def selected_environment(env: dict[str, str] | None) -> dict[str, str]:
@@ -981,6 +1020,601 @@ def analyze_error_message(
     )
 
 
+HIGH_RISK_COMMANDS = {
+    "cfdisk": "can modify disk partitions",
+    "clc": "clears file content through the PowerShell Clear-Content alias",
+    "clear-content": "removes file content",
+    "dd": "can overwrite disks or files byte-for-byte",
+    "del": "deletes files",
+    "diskpart": "can modify disks and partitions",
+    "erase": "deletes files",
+    "fdisk": "can modify disk partitions",
+    "format": "formats a storage volume",
+    "gdisk": "can modify disk partitions",
+    "mkfs": "creates a filesystem and can erase existing data",
+    "parted": "can modify disk partitions",
+    "rd": "deletes directories",
+    "reboot": "restarts the computer",
+    "ri": "deletes items through the PowerShell Remove-Item alias",
+    "remove-item": "deletes filesystem or registry items",
+    "restart-computer": "restarts the computer",
+    "rmdir": "deletes directories",
+    "rm": "deletes files or directories",
+    "sfdisk": "can modify disk partitions",
+    "shred": "overwrites file content",
+    "shutdown": "stops or restarts the computer",
+    "stop-computer": "stops the computer",
+    "truncate": "can discard existing file content",
+    "unlink": "deletes a filesystem entry",
+    "wipefs": "removes filesystem signatures",
+}
+
+READ_ONLY_COMMANDS = {
+    "dir",
+    "echo",
+    "get-childitem",
+    "get-date",
+    "get-location",
+    "get-process",
+    "gci",
+    "hostname",
+    "ls",
+    "printf",
+    "ps",
+    "pwd",
+    "systeminfo",
+    "tasklist",
+    "type",
+    "where",
+    "which",
+    "whoami",
+}
+
+CODE_EXECUTORS = {
+    "bash",
+    "cmd",
+    "node",
+    "perl",
+    "powershell",
+    "pwsh",
+    "py",
+    "python",
+    "python3",
+    "ruby",
+    "sh",
+    "wsl",
+}
+
+COMMAND_WRAPPERS = {"command", "doas", "env", "nohup", "sudo"}
+
+KNOWN_MUTATING_COMMANDS = {
+    "add-content",
+    "chmod",
+    "chown",
+    "copy",
+    "cp",
+    "install",
+    "md",
+    "mkdir",
+    "move",
+    "move-item",
+    "mv",
+    "new-item",
+    "npm",
+    "pip",
+    "pip3",
+    "rename-item",
+    "set-content",
+    "touch",
+}
+
+FORCE_FLAGS = {
+    "--force",
+    "--force-with-lease",
+    "-f",
+    "-force",
+    "/f",
+}
+
+RECURSIVE_FLAGS = {
+    "--recursive",
+    "-r",
+    "-recurse",
+    "/s",
+}
+
+GIT_READ_ONLY_SUBCOMMANDS = {
+    "diff",
+    "grep",
+    "help",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "rev-parse",
+    "show",
+    "status",
+    "version",
+}
+
+
+def normalized_command_name(token: str) -> str:
+    """Return a case-insensitive command basename without launcher suffixes."""
+
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for suffix in (".exe", ".com", ".cmd", ".bat", ".ps1"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def git_subcommand(argv: tuple[str, ...]) -> tuple[str | None, tuple[str, ...]]:
+    """Find a Git subcommand while skipping common global options."""
+
+    options_with_values = {
+        "-c",
+        "-C",
+        "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--namespace",
+        "--super-prefix",
+        "--work-tree",
+    }
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        folded = token.casefold()
+        if token in options_with_values:
+            index += 2
+            continue
+        if any(
+            folded.startswith(option.casefold() + "=")
+            for option in options_with_values
+            if option.startswith("--")
+        ):
+            index += 1
+            continue
+        if token == "--":
+            index += 1
+            break
+        if token.startswith("-"):
+            index += 1
+            continue
+        return folded, tuple(argv[index + 1 :])
+    if index < len(argv):
+        return argv[index].casefold(), tuple(argv[index + 1 :])
+    return None, ()
+
+
+def is_broad_target(token: str) -> bool:
+    """Recognize filesystem roots and home-wide target expressions."""
+
+    value = token.strip().strip("\"'").casefold()
+    if "=" in value:
+        value = value.rsplit("=", 1)[-1]
+    if value in {
+        "/",
+        "\\",
+        "~",
+        "~/",
+        "~\\",
+        "$home",
+        "${home}",
+        "%homepath%",
+        "%userprofile%",
+    }:
+        return True
+    return re.fullmatch(r"[a-z]:[\\/]?", value) is not None
+
+
+def is_device_target(token: str) -> bool:
+    """Recognize raw disk and device paths conservatively."""
+
+    value = token.strip().strip("\"'").casefold().replace("\\", "/")
+    if "=" in value:
+        value = value.rsplit("=", 1)[-1]
+    return bool(
+        value.startswith("//./physicaldrive")
+        or value.startswith("/dev/sd")
+        or value.startswith("/dev/nvme")
+        or value.startswith("/dev/mmcblk")
+        or value in {"/dev/mem", "/dev/kmem"}
+    )
+
+
+def shell_payload(argv: tuple[str, ...], command: str) -> str | None:
+    """Return explicit shell command text when a supported launcher uses it."""
+
+    flags = {
+        "bash": {"-c"},
+        "cmd": {"/c", "/k"},
+        "powershell": {"-c", "-command"},
+        "pwsh": {"-c", "-command"},
+        "sh": {"-c"},
+    }.get(command)
+    if flags is None:
+        return None
+    for index, token in enumerate(argv[1:], start=1):
+        if token.casefold() in flags and index + 1 < len(argv):
+            return " ".join(argv[index + 1 :]).strip()
+    return None
+
+
+def wrapped_command(argv: tuple[str, ...], command: str) -> tuple[str, ...] | None:
+    """Return the command passed through a recognized command wrapper."""
+
+    if command not in COMMAND_WRAPPERS:
+        return None
+    index = 1
+    options_with_values = {
+        "env": {"-C", "-S", "-u", "--chdir", "--split-string", "--unset"},
+        "sudo": {
+            "-C",
+            "-D",
+            "-g",
+            "-h",
+            "-p",
+            "-R",
+            "-T",
+            "-u",
+            "--chdir",
+            "--group",
+            "--host",
+            "--prompt",
+            "--user",
+        },
+        "doas": {"-C", "-u"},
+    }.get(command, set())
+    joined_value_prefixes = {
+        "env": ("-C", "-S", "-u"),
+        "sudo": ("-C", "-D", "-g", "-h", "-p", "-R", "-T", "-u"),
+        "doas": ("-C", "-u"),
+    }.get(command, ())
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            index += 1
+            break
+        if token in options_with_values:
+            index += 2
+            continue
+        if any(
+            token.startswith(option + "=")
+            for option in options_with_values
+            if option.startswith("--")
+        ) or any(
+            token.startswith(prefix) and token != prefix
+            for prefix in joined_value_prefixes
+        ):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        if command == "env" and "=" in token and not token.startswith("="):
+            index += 1
+            continue
+        break
+    return tuple(argv[index:]) if index < len(argv) else None
+
+
+def nested_destructive_command(payload: str) -> str | None:
+    """Recognize a destructive command at a shell command boundary."""
+
+    names = sorted(HIGH_RISK_COMMANDS, key=len, reverse=True)
+    alternatives = "|".join(re.escape(name) for name in names)
+    match = re.search(
+        rf"(?:^|[;&|]\s*)[\"']?\s*({alternatives})(?:\.exe|\.com|\.cmd|\.bat|\.ps1)?(?:\s|$)",
+        payload,
+        flags=re.IGNORECASE,
+    )
+    return None if match is None else match.group(1).casefold()
+
+
+def assess_command_safety(argv: list[str] | tuple[str, ...]) -> SafetyAssessment:
+    """Classify a command without executing, resolving or modifying anything."""
+
+    command = tuple(str(token) for token in argv)
+    findings: list[SafetyFinding] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(level: RiskLevel, rule: str, reason: str, evidence: str) -> None:
+        key = (rule, evidence)
+        if key not in seen:
+            findings.append(SafetyFinding(level, rule, reason, evidence))
+            seen.add(key)
+
+    if not command:
+        add(
+            RiskLevel.MEDIUM,
+            "empty-command",
+            "an empty command cannot be proven read-only",
+            "no executable token was supplied",
+        )
+        return SafetyAssessment(RiskLevel.MEDIUM, tuple(findings))
+
+    executable = normalized_command_name(command[0])
+    folded_arguments = tuple(token.casefold() for token in command[1:])
+
+    destructive_reason = HIGH_RISK_COMMANDS.get(executable)
+    if destructive_reason is not None:
+        add(
+            RiskLevel.HIGH,
+            "destructive-command",
+            destructive_reason,
+            f"executable token: {executable}",
+        )
+    elif executable.startswith("mkfs."):
+        add(
+            RiskLevel.HIGH,
+            "filesystem-format",
+            "creates a filesystem and can erase existing data",
+            f"executable token: {executable}",
+        )
+
+    if executable == "git":
+        subcommand, git_arguments = git_subcommand(command)
+        folded_git_arguments = tuple(token.casefold() for token in git_arguments)
+        help_only = "--help" in folded_arguments or "-h" in folded_git_arguments
+        if help_only:
+            add(
+                RiskLevel.LOW,
+                "git-help",
+                "Git help only displays documentation",
+                "Git help flag",
+            )
+        elif subcommand == "clean":
+            add(
+                RiskLevel.HIGH,
+                "git-clean",
+                "git clean can permanently remove untracked files",
+                "Git subcommand: clean",
+            )
+        elif subcommand == "reset" and "--hard" in folded_git_arguments:
+            add(
+                RiskLevel.HIGH,
+                "git-reset-hard",
+                "git reset --hard can discard uncommitted work",
+                "Git operation: reset --hard",
+            )
+        elif subcommand == "restore" and git_arguments:
+            add(
+                RiskLevel.HIGH,
+                "git-restore",
+                "git restore can discard working-tree changes",
+                "Git subcommand: restore",
+            )
+        elif subcommand == "checkout" and "--" in folded_git_arguments:
+            add(
+                RiskLevel.HIGH,
+                "git-checkout-path",
+                "git checkout -- <path> can discard working-tree changes",
+                "Git checkout contains the path separator --",
+            )
+        elif subcommand == "branch" and any(
+            token in {"-d", "--delete"} for token in folded_git_arguments
+        ):
+            add(
+                RiskLevel.HIGH,
+                "git-branch-delete",
+                "deleting a branch can remove an otherwise unreferenced history tip",
+                "Git branch delete flag",
+            )
+        elif subcommand == "push" and any(
+            token in {"-f", "--force", "--force-with-lease", "--delete"}
+            for token in folded_git_arguments
+        ):
+            add(
+                RiskLevel.HIGH,
+                "git-destructive-push",
+                "forced or deleting pushes can rewrite remote repository state",
+                "Git push force/delete flag",
+            )
+        elif subcommand == "stash" and any(
+            token in {"clear", "drop"} for token in folded_git_arguments
+        ):
+            add(
+                RiskLevel.HIGH,
+                "git-stash-delete",
+                "dropping or clearing stashes can remove saved work",
+                "Git stash drop/clear operation",
+            )
+        elif subcommand in GIT_READ_ONLY_SUBCOMMANDS:
+            add(
+                RiskLevel.LOW,
+                "git-read-only",
+                "the recognized Git subcommand only reads repository information",
+                f"Git subcommand: {subcommand}",
+            )
+        else:
+            add(
+                RiskLevel.MEDIUM,
+                "git-state-change-possible",
+                "this Git operation is not proven read-only",
+                f"Git subcommand: {subcommand or '(none)'}",
+            )
+
+    payload = shell_payload(command, executable)
+    if payload is not None:
+        nested = nested_destructive_command(payload)
+        if nested is not None:
+            add(
+                RiskLevel.HIGH,
+                "nested-destructive-command",
+                "explicit shell command text launches a destructive command",
+                f"nested executable token: {nested}",
+            )
+        else:
+            add(
+                RiskLevel.MEDIUM,
+                "shell-command-text",
+                "shell command text can perform actions that static token checks "
+                "cannot prove safe",
+                f"launcher: {executable}",
+            )
+
+    wrapped = wrapped_command(command, executable)
+    if wrapped is not None:
+        add(
+            RiskLevel.MEDIUM,
+            "command-wrapper",
+            "a command wrapper can alter privileges or execution context",
+            f"wrapper executable: {executable}",
+        )
+        wrapped_assessment = assess_command_safety(wrapped)
+        for finding in wrapped_assessment.findings:
+            add(
+                finding.level,
+                "wrapped-" + finding.rule,
+                finding.reason,
+                "wrapped command: " + finding.evidence,
+            )
+
+    for token in command[1:]:
+        stripped = token.strip()
+        if re.fullmatch(r"(?:\d+|&|\*)?>>.*", stripped):
+            add(
+                RiskLevel.MEDIUM,
+                "append-redirection",
+                "append redirection changes a file or device destination",
+                "append redirection operator: >>",
+            )
+        elif re.fullmatch(r"(?:\d+|&|\*)?>(?!>).*", stripped):
+            add(
+                RiskLevel.HIGH,
+                "overwrite-redirection",
+                "overwrite redirection can replace existing file or device content",
+                "overwrite redirection operator: >",
+            )
+        elif stripped in {"&&", ";", "|", "||"}:
+            add(
+                RiskLevel.MEDIUM,
+                "compound-shell-syntax",
+                "compound shell syntax can launch additional commands",
+                f"shell operator: {stripped}",
+            )
+
+    destructive_executable = (
+        executable in HIGH_RISK_COMMANDS or executable.startswith("mkfs.")
+    )
+    combined_force = destructive_executable and any(
+        token.startswith("-")
+        and not token.startswith("--")
+        and "f" in token[1:].casefold()
+        for token in command[1:]
+    )
+    combined_recursive = destructive_executable and any(
+        token.startswith("-")
+        and not token.startswith("--")
+        and "r" in token[1:].casefold()
+        for token in command[1:]
+    )
+    if executable not in READ_ONLY_COMMANDS and (
+        any(token in FORCE_FLAGS for token in folded_arguments) or combined_force
+    ):
+        add(
+            RiskLevel.MEDIUM,
+            "force-flag",
+            "a force flag may bypass normal safeguards",
+            "force option present",
+        )
+    if executable not in READ_ONLY_COMMANDS and (
+        any(token in RECURSIVE_FLAGS for token in folded_arguments)
+        or combined_recursive
+    ):
+        add(
+            RiskLevel.MEDIUM,
+            "recursive-flag",
+            "a recursive flag can widen the affected scope",
+            "recursive option present",
+        )
+
+    destructive_context = any(
+        finding.level is RiskLevel.HIGH
+        and finding.rule
+        in {
+            "destructive-command",
+            "filesystem-format",
+            "nested-destructive-command",
+            "overwrite-redirection",
+        }
+        for finding in findings
+    )
+    if destructive_context:
+        if any(is_broad_target(token) for token in command[1:]):
+            add(
+                RiskLevel.HIGH,
+                "broad-target",
+                "a destructive operation targets a filesystem root or home-wide expression",
+                "broad target detected",
+            )
+        if any(is_device_target(token) for token in command[1:]):
+            add(
+                RiskLevel.HIGH,
+                "device-target",
+                "a destructive operation targets a raw disk or device",
+                "raw device target detected",
+            )
+
+    if not findings:
+        if executable in READ_ONLY_COMMANDS:
+            add(
+                RiskLevel.LOW,
+                "recognized-read-only-command",
+                "the recognized command only displays information",
+                f"executable token: {executable}",
+            )
+        elif executable in {"py", "python", "python3"} and command[1:] in {
+            ("--help",),
+            ("--version",),
+            ("-h",),
+            ("-V",),
+            ("-VV",),
+        }:
+            add(
+                RiskLevel.LOW,
+                "python-information-only",
+                "this Python option only displays interpreter information",
+                f"Python option: {command[1]}",
+            )
+        elif executable in CODE_EXECUTORS:
+            add(
+                RiskLevel.MEDIUM,
+                "code-execution-possible",
+                "the interpreter or shell can execute user-supplied code",
+                f"executable token: {executable}",
+            )
+        elif executable in KNOWN_MUTATING_COMMANDS:
+            add(
+                RiskLevel.MEDIUM,
+                "state-change-possible",
+                "the recognized command can create or modify local state",
+                f"executable token: {executable}",
+            )
+        else:
+            add(
+                RiskLevel.MEDIUM,
+                "unknown-command",
+                "unknown commands are never assumed to be read-only",
+                f"executable token: {executable or '(empty)'}",
+            )
+
+    level = max(findings, key=lambda finding: RISK_PRIORITY[finding.level]).level
+    return SafetyAssessment(level, tuple(findings))
+
+
+def correction_preserves_risk(
+    original_argv: list[str] | tuple[str, ...],
+    suggested_argv: list[str] | tuple[str, ...],
+) -> tuple[bool, SafetyAssessment, SafetyAssessment]:
+    """Reject corrections that increase the conservative safety level."""
+
+    original = assess_command_safety(original_argv)
+    suggested = assess_command_safety(suggested_argv)
+    allowed = RISK_PRIORITY[suggested.level] <= RISK_PRIORITY[original.level]
+    return allowed, original, suggested
+
+
 def display_token(token: str) -> str:
     """Render one argument unambiguously for display only."""
 
@@ -993,6 +1627,78 @@ def display_argv(argv: tuple[str, ...] | list[str]) -> str:
     """Render an argument vector for review; the result is never executed."""
 
     return " ".join(display_token(token) for token in argv)
+
+
+def render_safety_assessment(assessment: SafetyAssessment) -> str:
+    """Render a safety label and the exact deterministic evidence behind it."""
+
+    decision = (
+        "BLOCKED - future execution must not proceed."
+        if assessment.blocked
+        else "REVIEW - this classification does not execute or approve the command."
+    )
+    lines = [
+        "Safety assessment:",
+        f"  Risk: {assessment.level.value}",
+        f"  Decision: {decision}",
+        "  Evidence:",
+    ]
+    for finding in assessment.findings:
+        lines.extend(
+            (
+                f"    - [{finding.rule}] {finding.reason}",
+                f"      Evidence: {finding.evidence}",
+            )
+        )
+    lines.extend(
+        (
+            "  Note: a Low label is conservative evidence, not a guarantee.",
+            "Nothing was executed.",
+        )
+    )
+    return "\n".join(lines)
+
+
+def render_blocked_correction(
+    original: SafetyAssessment,
+    suggested: SafetyAssessment,
+) -> str:
+    """Explain why a risk-increasing correction was withheld."""
+
+    blocking_reasons = tuple(
+        finding for finding in suggested.findings if finding.level is suggested.level
+    )
+    lines = [
+        "Correction blocked:",
+        "  A proposed correction was withheld because it increased command risk.",
+        f"  Original risk: {original.level.value}",
+        f"  Proposed risk: {suggested.level.value}",
+        "  Blocking evidence:",
+    ]
+    for finding in blocking_reasons:
+        lines.extend(
+            (
+                f"    - [{finding.rule}] {finding.reason}",
+                f"      Evidence: {finding.evidence}",
+            )
+        )
+    lines.extend(("No runnable correction was returned.", "Nothing was executed."))
+    return "\n".join(lines)
+
+
+def corrected_argv(
+    argv: list[str] | tuple[str, ...],
+    executable_correction: Correction | None,
+    path_corrections: tuple[PathCorrection, ...],
+) -> tuple[str, ...]:
+    """Apply proven token replacements to an in-memory argument vector."""
+
+    suggested = list(str(token) for token in argv)
+    if executable_correction is not None:
+        suggested[0] = executable_correction.suggested_token
+    for correction in path_corrections:
+        suggested[correction.token_index] = correction.suggested_token
+    return tuple(suggested)
 
 
 def render_error_analysis(
@@ -1126,6 +1832,29 @@ def check_command(
             windows=windows,
             cwd=cwd,
         )
+        if (
+            analysis.has_correction
+            and analysis.token_index is not None
+            and analysis.suggestion is not None
+            and analysis.token_index < len(argv)
+        ):
+            suggestion = list(argv)
+            suggestion[analysis.token_index] = analysis.suggestion
+            allowed, original_safety, suggested_safety = correction_preserves_risk(
+                argv,
+                suggestion,
+            )
+            if not allowed:
+                print(
+                    render_blocked_correction(original_safety, suggested_safety),
+                    file=output,
+                )
+                return EXIT_BLOCKED
+            print(render_error_analysis(analysis, argv), file=output)
+            print("", file=output)
+            print(render_safety_assessment(suggested_safety), file=output)
+            return EXIT_BLOCKED if suggested_safety.blocked else EXIT_CORRECTION
+
         print(render_error_analysis(analysis, argv), file=output)
         return EXIT_CORRECTION if analysis.has_correction else EXIT_NOT_FOUND
 
@@ -1137,6 +1866,18 @@ def check_command(
 
     path_corrections, unresolved_paths = inspect_path_arguments(argv, cwd=cwd)
     if executable_correction is not None or path_corrections:
+        suggestion = corrected_argv(argv, executable_correction, path_corrections)
+        allowed, original_safety, suggested_safety = correction_preserves_risk(
+            argv,
+            suggestion,
+        )
+        if not allowed:
+            print(
+                render_blocked_correction(original_safety, suggested_safety),
+                file=output,
+            )
+            return EXIT_BLOCKED
+
         unresolved_messages = []
         if resolved is None and executable_correction is None:
             unresolved_messages.append(
@@ -1155,23 +1896,52 @@ def check_command(
             ),
             file=output,
         )
-        return EXIT_CORRECTION
+        print("", file=output)
+        print(render_safety_assessment(suggested_safety), file=output)
+        return EXIT_BLOCKED if suggested_safety.blocked else EXIT_CORRECTION
 
     if resolved is None:
+        safety = assess_command_safety(argv)
         print(f"Executable not found: {original}", file=output)
         print("No reliable correction found. Nothing was executed.", file=output)
-        return EXIT_NOT_FOUND
+        print("", file=output)
+        print(render_safety_assessment(safety), file=output)
+        return EXIT_BLOCKED if safety.blocked else EXIT_NOT_FOUND
 
     if unresolved_paths:
+        safety = assess_command_safety(argv)
         for index, token in unresolved_paths:
             print(f"Path not found at token {index}: {token}", file=output)
         print("No reliable path correction found. Nothing was executed.", file=output)
-        return EXIT_NOT_FOUND
+        print("", file=output)
+        print(render_safety_assessment(safety), file=output)
+        return EXIT_BLOCKED if safety.blocked else EXIT_NOT_FOUND
 
+    safety = assess_command_safety(argv)
     print(f"Command exists: {original}", file=output)
     print(f"Resolved executable: {resolved}", file=output)
     print("No correction is required. Nothing was executed.", file=output)
-    return EXIT_OK
+    print("", file=output)
+    print(render_safety_assessment(safety), file=output)
+    return EXIT_BLOCKED if safety.blocked else EXIT_OK
+
+
+def safety_command(
+    argv: list[str],
+    *,
+    output: object = sys.stdout,
+) -> int:
+    """Display a read-only safety classification for a supplied command."""
+
+    if not argv:
+        print("termfix: no command was supplied", file=sys.stderr)
+        return EXIT_USAGE
+    assessment = assess_command_safety(argv)
+    print("Command:", file=output)
+    print(f"  {display_argv(sanitized_argv(argv))}", file=output)
+    print("", file=output)
+    print(render_safety_assessment(assessment), file=output)
+    return EXIT_BLOCKED if assessment.blocked else EXIT_OK
 
 
 def strip_separator(command: list[str]) -> list[str]:
@@ -1186,8 +1956,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="termfix.py",
         description=(
-            "Proof-backed executable and path correction using only "
-            "Python's standard library."
+            "Proof-backed command correction and deterministic safety "
+            "classification using only Python's standard library."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1200,6 +1970,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="analyze supplied stderr text without executing the command",
     )
     check.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
+
+    safety = actions.add_parser(
+        "safety",
+        help="classify command risk without executing it",
+    )
+    safety.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
     actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
@@ -1224,6 +2000,8 @@ def cli(argv: list[str] | None = None) -> int:
             strip_separator(args.command),
             error_text=args.error_text,
         )
+    if args.action == "safety":
+        return safety_command(strip_separator(args.command))
     return EXIT_USAGE
 
 
@@ -1803,6 +2581,226 @@ class TermFixTests(unittest.TestCase):
             EXIT_USAGE,
         )
 
+    def test_python_version_is_low_risk(self) -> None:
+        assessment = assess_command_safety(["python.exe", "--version"])
+
+        self.assertEqual(assessment.level, RiskLevel.LOW)
+        self.assertEqual(assessment.findings[0].rule, "python-information-only")
+
+    def test_python_lowercase_verbose_flag_is_not_treated_as_version(self) -> None:
+        assessment = assess_command_safety(["python", "-v"])
+
+        self.assertEqual(assessment.level, RiskLevel.MEDIUM)
+
+    def test_git_status_is_low_risk(self) -> None:
+        assessment = assess_command_safety(["git", "status", "--short"])
+
+        self.assertEqual(assessment.level, RiskLevel.LOW)
+        self.assertEqual(assessment.findings[0].rule, "git-read-only")
+
+    def test_python_script_is_medium_risk(self) -> None:
+        assessment = assess_command_safety(["python", "app.py"])
+
+        self.assertEqual(assessment.level, RiskLevel.MEDIUM)
+        self.assertEqual(assessment.findings[0].rule, "code-execution-possible")
+
+    def test_unknown_command_is_never_assumed_low_risk(self) -> None:
+        assessment = assess_command_safety(["custom-tool", "inspect"])
+
+        self.assertEqual(assessment.level, RiskLevel.MEDIUM)
+        self.assertEqual(assessment.findings[0].rule, "unknown-command")
+
+    def test_delete_command_and_broad_target_are_high_risk(self) -> None:
+        assessment = assess_command_safety(["rm", "-rf", "/"])
+        rules = {finding.rule for finding in assessment.findings}
+
+        self.assertEqual(assessment.level, RiskLevel.HIGH)
+        self.assertIn("destructive-command", rules)
+        self.assertIn("broad-target", rules)
+        self.assertIn("force-flag", rules)
+        self.assertIn("recursive-flag", rules)
+
+    def test_windows_remove_item_is_high_risk(self) -> None:
+        assessment = assess_command_safety(
+            ["Remove-Item", "-Recurse", "-Force", "C:\\temp"]
+        )
+
+        self.assertEqual(assessment.level, RiskLevel.HIGH)
+        self.assertTrue(assessment.blocked)
+
+    def test_format_shutdown_and_disk_tools_are_high_risk(self) -> None:
+        for argv in (
+            ["format.com", "D:"],
+            ["shutdown", "/s"],
+            ["diskpart"],
+            ["mkfs.ext4", "/dev/sda1"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(
+                    assess_command_safety(argv).level,
+                    RiskLevel.HIGH,
+                )
+
+    def test_git_clean_and_reset_hard_are_high_risk(self) -> None:
+        for argv in (["git", "clean", "-fd"], ["git", "reset", "--hard"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(
+                    assess_command_safety(argv).level,
+                    RiskLevel.HIGH,
+                )
+
+    def test_other_destructive_git_operations_are_high_risk(self) -> None:
+        commands = (
+            ["git", "branch", "-D", "old-work"],
+            ["git", "checkout", "--", "changed.txt"],
+            ["git", "push", "--force", "origin", "main"],
+            ["git", "stash", "clear"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                self.assertEqual(
+                    assess_command_safety(argv).level,
+                    RiskLevel.HIGH,
+                )
+
+    def test_forced_git_operation_carries_force_evidence(self) -> None:
+        assessment = assess_command_safety(["git", "fetch", "--force"])
+        rules = {finding.rule for finding in assessment.findings}
+
+        self.assertEqual(assessment.level, RiskLevel.MEDIUM)
+        self.assertIn("force-flag", rules)
+
+    def test_overwrite_redirection_is_high_risk(self) -> None:
+        assessment = assess_command_safety(["echo", "replacement", ">", "file.txt"])
+
+        self.assertEqual(assessment.level, RiskLevel.HIGH)
+        self.assertEqual(assessment.findings[0].rule, "overwrite-redirection")
+
+    def test_raw_device_target_is_reported(self) -> None:
+        assessment = assess_command_safety(["dd", "if=image", "of=/dev/sda"])
+        rules = {finding.rule for finding in assessment.findings}
+
+        self.assertEqual(assessment.level, RiskLevel.HIGH)
+        self.assertIn("device-target", rules)
+
+    def test_nested_shell_deletion_is_high_risk(self) -> None:
+        assessment = assess_command_safety(
+            ["powershell", "-Command", "Remove-Item C:\\temp"]
+        )
+
+        self.assertEqual(assessment.level, RiskLevel.HIGH)
+        self.assertEqual(assessment.findings[0].rule, "nested-destructive-command")
+
+    def test_privilege_wrapper_cannot_hide_deletion(self) -> None:
+        assessment = assess_command_safety(
+            ["sudo", "--user=root", "rm", "-rf", "/"]
+        )
+        rules = {finding.rule for finding in assessment.findings}
+
+        self.assertEqual(assessment.level, RiskLevel.HIGH)
+        self.assertIn("wrapped-destructive-command", rules)
+        self.assertIn("wrapped-broad-target", rules)
+
+    def test_harmless_text_that_mentions_rm_is_not_high_risk(self) -> None:
+        assessment = assess_command_safety(["echo", "rm -rf /"])
+
+        self.assertEqual(assessment.level, RiskLevel.LOW)
+
+    def test_safety_classification_is_deterministic_and_non_mutating(self) -> None:
+        argv = ["git", "status", "--short"]
+        original = list(argv)
+
+        self.assertEqual(
+            assess_command_safety(argv),
+            assess_command_safety(argv),
+        )
+        self.assertEqual(argv, original)
+
+    def test_risk_increasing_executable_correction_is_withheld(self) -> None:
+        output = self._output()
+        candidate = ExecutableCandidate("rm", "rm.exe", "C:/Tools/rm.exe")
+        with (
+            mock.patch(__name__ + ".command_exists", return_value=None),
+            mock.patch(__name__ + ".discover_executables", return_value=(candidate,)),
+        ):
+            code = check_command(
+                ["rmm", "file.txt"],
+                env={},
+                windows=True,
+                output=output,
+            )
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        self.assertIn("Correction blocked", output.getvalue())
+        self.assertIn("No runnable correction was returned", output.getvalue())
+
+    def test_error_correction_cannot_turn_git_typo_into_git_clean(self) -> None:
+        output = self._output()
+        error = (
+            "git: 'clea' is not a git command. See 'git --help'.\n\n"
+            "The most similar command is\n\tclean"
+        )
+        code = check_command(
+            ["git", "clea"],
+            error_text=error,
+            output=output,
+        )
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        self.assertIn("Proposed risk: High", output.getvalue())
+        self.assertNotIn("Suggestion:", output.getvalue())
+
+    def test_normal_correction_keeps_safety_evidence(self) -> None:
+        output = self._output()
+        candidate = ExecutableCandidate("python", "python.exe", "C:/Python/python.exe")
+        with (
+            mock.patch(__name__ + ".command_exists", return_value=None),
+            mock.patch(__name__ + ".discover_executables", return_value=(candidate,)),
+        ):
+            code = check_command(
+                ["pyhton", "app.py"],
+                env={},
+                windows=True,
+                output=output,
+            )
+
+        self.assertEqual(code, EXIT_CORRECTION)
+        self.assertIn("Safety assessment", output.getvalue())
+        self.assertIn("Risk: Medium", output.getvalue())
+
+    def test_safety_command_returns_blocked_for_high_risk(self) -> None:
+        output = self._output()
+        code = safety_command(["git", "reset", "--hard"], output=output)
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        self.assertIn("BLOCKED", output.getvalue())
+        self.assertIn("Nothing was executed", output.getvalue())
+
+    def test_check_returns_blocked_for_existing_high_risk_command(self) -> None:
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Program Files/Git/cmd/git.exe",
+        ):
+            code = check_command(["git", "reset", "--hard"], output=output)
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        self.assertIn("Risk: High", output.getvalue())
+
+    def test_safety_command_returns_usage_without_command(self) -> None:
+        self.assertEqual(safety_command([], output=self._output()), EXIT_USAGE)
+
+    def test_keyboard_interrupt_uses_cancelled_exit_code(self) -> None:
+        error_output = self._output()
+        with (
+            mock.patch(__name__ + ".cli", side_effect=KeyboardInterrupt),
+            mock.patch(__name__ + ".sys.stderr", error_output),
+        ):
+            code = main()
+
+        self.assertEqual(code, EXIT_CANCELLED)
+        self.assertIn("cancelled", error_output.getvalue())
+
     def test_check_has_no_execution_module(self) -> None:
         self.assertNotIn("subprocess", globals())
 
@@ -1820,7 +2818,7 @@ def main() -> int:
         return cli()
     except KeyboardInterrupt:
         print("termfix: cancelled", file=sys.stderr)
-        return EXIT_NOT_FOUND
+        return EXIT_CANCELLED
     except SystemExit:
         raise
     except Exception as error:
