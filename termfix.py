@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-3: proof-backed executable and path correction.
+"""TermFix Steps 2-4: proof-backed command, path and error correction.
 
 Executable candidates come from PATH. File and directory candidates come from
-the relevant local directory. Every match is deterministic, and the inspected
-command is never executed.
+the relevant local directory. Error evidence comes from recognized stderr
+patterns. Every match is deterministic, and the inspected command is never
+executed.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -23,7 +25,7 @@ from unittest import mock
 
 
 APP_NAME = "TermFix"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -41,6 +43,18 @@ class MatchLabel(str, Enum):
 
     HIGH = "High"
     MEDIUM = "Medium"
+
+
+class ErrorCategory(str, Enum):
+    """Error families recognized by the deterministic stderr rule engine."""
+
+    COMMAND_NOT_FOUND = "command not found"
+    FILE_NOT_FOUND = "file not found"
+    MODULE_NOT_FOUND = "module not found"
+    INVALID_CHOICE = "invalid choice"
+    UNRECOGNIZED_ARGUMENT = "unrecognized argument"
+    PERMISSION_DENIED = "permission denied"
+    UNKNOWN = "unknown error"
 
 
 @dataclass(frozen=True)
@@ -89,6 +103,25 @@ class PathCorrection:
     reason: str
     evidence: str
     resolved_path: str
+
+
+@dataclass(frozen=True)
+class ErrorAnalysis:
+    """Structured, sanitized evidence extracted from an error message."""
+
+    category: ErrorCategory
+    extracted_token: str | None
+    token_index: int | None
+    suggestion: str | None
+    score: int | None
+    label: MatchLabel | None
+    reason: str
+    evidence_source: str
+    resolved_evidence: str | None = None
+
+    @property
+    def has_correction(self) -> bool:
+        return self.suggestion is not None
 
 
 def selected_environment(env: dict[str, str] | None) -> dict[str, str]:
@@ -403,11 +436,12 @@ def find_path_correction(
     token_index: int,
     *,
     cwd: str | os.PathLike[str] | Path | None = None,
+    assume_path: bool = False,
 ) -> PathCorrection | None:
     """Correct at most one path component and prove the final path exists."""
 
     working_directory = Path.cwd() if cwd is None else Path(cwd)
-    if not looks_like_path(token, working_directory):
+    if not assume_path and not looks_like_path(token, working_directory):
         return None
 
     try:
@@ -550,6 +584,403 @@ def inspect_path_arguments(
     return tuple(corrections), tuple(unresolved)
 
 
+def locate_token(argv: list[str] | tuple[str, ...], token: str) -> int | None:
+    """Locate an error token in the original argument vector deterministically."""
+
+    target = token.casefold()
+    for index, argument in enumerate(argv):
+        if str(argument).casefold() == target:
+            return index
+
+    try:
+        target_name = Path(token).name.casefold()
+        for index, argument in enumerate(argv):
+            if Path(str(argument)).name.casefold() == target_name:
+                return index
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def rank_text_candidates(
+    original: str,
+    candidates: tuple[str, ...] | list[str],
+) -> tuple[str, int, str] | None:
+    """Select the strongest deterministic candidate from trusted text evidence."""
+
+    ranked: list[tuple[int, str, str, str]] = []
+    seen: set[str] = set()
+    for raw_candidate in candidates:
+        candidate = str(raw_candidate).strip()
+        key = candidate.casefold()
+        if not candidate or key in seen or key == original.casefold():
+            continue
+        seen.add(key)
+        score, reason = similarity_score(original, candidate)
+        if score < MINIMUM_MATCH_SCORE:
+            continue
+        ranked.append((-score, key, candidate, reason))
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    negative_score, _, suggestion, reason = ranked[0]
+    return suggestion, -negative_score, reason
+
+
+def explicit_suggestions(message: str) -> tuple[str, ...]:
+    """Extract candidates that the program explicitly offered in stderr."""
+
+    suggestions: list[str] = []
+    patterns = (
+        r"did you mean(?: one of)?\s*[:?]?\s*['\"]?(?P<value>[-\w.]+)",
+        r"most similar commands?\s+(?:is|are)\s*['\"]?(?P<value>[-\w.]+)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, message, re.IGNORECASE):
+            suggestions.append(match.group("value"))
+    return tuple(suggestions)
+
+
+def allowed_choices(message: str) -> tuple[str, ...]:
+    """Extract argparse-style choices that were explicitly listed in stderr."""
+
+    match = re.search(r"choose from\s+(?P<choices>[^\r\n)]+)", message, re.IGNORECASE)
+    if match is None:
+        return ()
+    return tuple(re.findall(r"['\"]([^'\"]+)['\"]", match.group("choices")))
+
+
+def discover_module_candidates(cwd: Path) -> tuple[tuple[str, str], ...]:
+    """Discover standard-library and neighboring local Python module names."""
+
+    candidates = {
+        name: "Python standard library"
+        for name in getattr(sys, "stdlib_module_names", frozenset())
+    }
+    try:
+        with os.scandir(cwd) as directory_entries:
+            entries = sorted(
+                directory_entries,
+                key=lambda entry: (entry.name.casefold(), entry.name),
+            )
+    except (OSError, ValueError):
+        entries = []
+
+    for entry in entries:
+        try:
+            if entry.is_file() and Path(entry.name).suffix.casefold() == ".py":
+                name = Path(entry.name).stem
+                candidates.setdefault(name, f"local module {entry.name!r}")
+            elif entry.is_dir() and safe_path_exists(Path(entry.path) / "__init__.py"):
+                candidates.setdefault(entry.name, f"local package {entry.name!r}")
+        except OSError:
+            continue
+
+    return tuple(
+        sorted(
+            candidates.items(),
+            key=lambda item: (item[0].casefold(), item[0], item[1]),
+        )
+    )
+
+
+def find_module_correction(
+    module: str,
+    cwd: Path,
+) -> tuple[str, int, str, str] | None:
+    """Suggest a proven standard-library or neighboring local module."""
+
+    head, separator, remainder = module.partition(".")
+    candidate_sources = discover_module_candidates(cwd)
+    ranked = rank_text_candidates(head, [name for name, _ in candidate_sources])
+    if ranked is None:
+        return None
+
+    candidate, score, reason = ranked
+    sources = dict(candidate_sources)
+    suggestion = candidate + (separator + remainder if separator else "")
+    return suggestion, score, reason, sources[candidate]
+
+
+def sanitized_error_token(token: str | None) -> str | None:
+    """Redact obvious credentials and bound extracted-token display length."""
+
+    if token is None:
+        return None
+    safe = re.sub(
+        r"(?i)(password|passwd|token|api[_-]?key|authorization)=([^\s]+)",
+        r"\1=<redacted>",
+        token,
+    )
+    safe = re.sub(r"(?i)(://)[^/@:\s]+:[^/@\s]+@", r"\1<redacted>@", safe)
+    return safe[:512]
+
+
+def sanitized_argv(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Redact values associated with common sensitive command-line flags."""
+
+    sensitive_flags = {
+        "--api-key",
+        "--apikey",
+        "--authorization",
+        "--auth-token",
+        "--password",
+        "--passwd",
+        "--secret",
+        "--token",
+    }
+    sanitized: list[str] = []
+    redact_next = False
+    for raw_token in argv:
+        token = str(raw_token)
+        if redact_next:
+            sanitized.append("<redacted>")
+            redact_next = False
+            continue
+
+        safe = sanitized_error_token(token) or ""
+        sanitized.append(safe)
+        flag = token.split("=", 1)[0].casefold()
+        if flag in sensitive_flags and "=" not in token:
+            redact_next = True
+    return tuple(sanitized)
+
+
+def analyze_error_message(
+    error_text: str,
+    argv: list[str] | tuple[str, ...],
+    *,
+    env: dict[str, str] | None = None,
+    windows: bool | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> ErrorAnalysis:
+    """Recognize one useful stderr pattern without executing or trusting its text."""
+
+    message = str(error_text)[:65536]
+    working_directory = Path.cwd() if cwd is None else Path(cwd)
+
+    invalid = re.search(
+        r"invalid choice:\s*['\"](?P<token>[^'\"]+)['\"]",
+        message,
+        re.IGNORECASE,
+    )
+    if invalid is not None:
+        token = invalid.group("token")
+        choices = (*allowed_choices(message), *explicit_suggestions(message))
+        ranked = rank_text_candidates(token, list(choices))
+        return ErrorAnalysis(
+            category=ErrorCategory.INVALID_CHOICE,
+            extracted_token=sanitized_error_token(token),
+            token_index=locate_token(argv, token),
+            suggestion=None if ranked is None else ranked[0],
+            score=None if ranked is None else ranked[1],
+            label=None if ranked is None else match_label(ranked[1]),
+            reason=(
+                "program rejected an invalid choice"
+                if ranked is None
+                else f"{ranked[2]}; candidate was explicitly listed by the program"
+            ),
+            evidence_source="recognized stderr invalid-choice rule",
+            resolved_evidence=(
+                None if ranked is None else "stderr explicitly listed the allowed choice"
+            ),
+        )
+
+    git_subcommand = re.search(
+        r"git:\s*['\"](?P<token>[^'\"]+)['\"]\s+is not a git command",
+        message,
+        re.IGNORECASE,
+    )
+    if git_subcommand is not None:
+        token = git_subcommand.group("token")
+        ranked = rank_text_candidates(token, list(explicit_suggestions(message)))
+        return ErrorAnalysis(
+            category=ErrorCategory.INVALID_CHOICE,
+            extracted_token=sanitized_error_token(token),
+            token_index=locate_token(argv, token),
+            suggestion=None if ranked is None else ranked[0],
+            score=None if ranked is None else ranked[1],
+            label=None if ranked is None else match_label(ranked[1]),
+            reason=(
+                "Git rejected the subcommand"
+                if ranked is None
+                else f"{ranked[2]}; Git explicitly suggested this subcommand"
+            ),
+            evidence_source="recognized Git stderr rule",
+            resolved_evidence=(
+                None if ranked is None else "stderr explicitly suggested the subcommand"
+            ),
+        )
+
+    module_match = re.search(
+        r"(?:ModuleNotFoundError:\s*)?No module named\s+['\"](?P<token>[^'\"]+)['\"]",
+        message,
+        re.IGNORECASE,
+    )
+    if module_match is not None:
+        token = module_match.group("token")
+        correction = find_module_correction(token, working_directory)
+        return ErrorAnalysis(
+            category=ErrorCategory.MODULE_NOT_FOUND,
+            extracted_token=sanitized_error_token(token),
+            token_index=locate_token(argv, token),
+            suggestion=None if correction is None else correction[0],
+            score=None if correction is None else correction[1],
+            label=None if correction is None else match_label(correction[1]),
+            reason=(
+                "Python reported a missing module"
+                if correction is None
+                else f"{correction[2]}; candidate is a proven module name"
+            ),
+            evidence_source="recognized Python module-error rule",
+            resolved_evidence=None if correction is None else correction[3],
+        )
+
+    file_patterns = (
+        r"can't open file\s+['\"](?P<token>[^'\"]+)['\"]",
+        r"No such file or directory:\s*['\"](?P<token>[^'\"]+)['\"]",
+        r"cannot find the file specified:\s*['\"](?P<token>[^'\"]+)['\"]",
+    )
+    file_match = next(
+        (
+            match
+            for pattern in file_patterns
+            if (match := re.search(pattern, message, re.IGNORECASE)) is not None
+        ),
+        None,
+    )
+    if file_match is not None:
+        token = file_match.group("token")
+        token_index = locate_token(argv, token)
+        correction = find_path_correction(
+            token,
+            1 if token_index is None else token_index,
+            cwd=working_directory,
+            assume_path=True,
+        )
+        return ErrorAnalysis(
+            category=ErrorCategory.FILE_NOT_FOUND,
+            extracted_token=sanitized_error_token(token),
+            token_index=token_index,
+            suggestion=None if correction is None else correction.suggested_token,
+            score=None if correction is None else correction.score,
+            label=None if correction is None else correction.label,
+            reason=(
+                "program reported a missing file or directory"
+                if correction is None
+                else f"{correction.reason}; suggested path exists locally"
+            ),
+            evidence_source="recognized missing-file stderr rule",
+            resolved_evidence=None if correction is None else correction.resolved_path,
+        )
+
+    command_patterns = (
+        r"(?mi)^\s*(?P<token>[^\s:]+):\s*command not found\s*$",
+        r"(?i)['\"](?P<token>[^'\"]+)['\"]\s+is not recognized as an internal or external command",
+        r"(?mi)^\s*(?P<token>[^\s:]+)\s*:\s*The term\s+['\"][^'\"]+['\"]\s+is not recognized",
+        r"(?i)executable\s+['\"](?P<token>[^'\"]+)['\"]\s+"
+        r"(?:was\s+)?not (?:found|recognized)",
+    )
+    command_match = next(
+        (
+            match
+            for pattern in command_patterns
+            if (match := re.search(pattern, message)) is not None
+        ),
+        None,
+    )
+    if command_match is not None:
+        token = command_match.group("token")
+        explicit = rank_text_candidates(token, list(explicit_suggestions(message)))
+        executable = None if explicit is not None else find_correction(
+            [token],
+            env,
+            windows=windows,
+        )
+        if explicit is not None:
+            suggestion, score, reason = explicit
+            resolved = "stderr explicitly suggested the executable"
+        elif executable is not None:
+            suggestion = executable.suggested_token
+            score = executable.score
+            reason = executable.reason
+            resolved = executable.executable_path
+        else:
+            suggestion = None
+            score = None
+            reason = "shell reported that the executable was not found"
+            resolved = None
+        return ErrorAnalysis(
+            category=ErrorCategory.COMMAND_NOT_FOUND,
+            extracted_token=sanitized_error_token(token),
+            token_index=locate_token(argv, token),
+            suggestion=suggestion,
+            score=score,
+            label=None if score is None else match_label(score),
+            reason=reason,
+            evidence_source="recognized command-not-found stderr rule",
+            resolved_evidence=resolved,
+        )
+
+    unrecognized = re.search(
+        r"unrecognized arguments?:\s*(?P<token>\S+)",
+        message,
+        re.IGNORECASE,
+    )
+    if unrecognized is not None:
+        token = unrecognized.group("token")
+        ranked = rank_text_candidates(token, list(explicit_suggestions(message)))
+        return ErrorAnalysis(
+            category=ErrorCategory.UNRECOGNIZED_ARGUMENT,
+            extracted_token=sanitized_error_token(token),
+            token_index=locate_token(argv, token),
+            suggestion=None if ranked is None else ranked[0],
+            score=None if ranked is None else ranked[1],
+            label=None if ranked is None else match_label(ranked[1]),
+            reason=(
+                "program rejected an unrecognized argument"
+                if ranked is None
+                else f"{ranked[2]}; program explicitly suggested this argument"
+            ),
+            evidence_source="recognized unrecognized-argument stderr rule",
+            resolved_evidence=(
+                None if ranked is None else "stderr explicitly suggested the argument"
+            ),
+        )
+
+    permission = re.search(
+        r"(?:PermissionError:.*?)?"
+        r"(?:permission denied|access is denied)"
+        r"(?:\s*:\s*['\"](?P<token>[^'\"]+)['\"])?",
+        message,
+        re.IGNORECASE,
+    )
+    if permission is not None:
+        token = permission.groupdict().get("token")
+        return ErrorAnalysis(
+            category=ErrorCategory.PERMISSION_DENIED,
+            extracted_token=sanitized_error_token(token),
+            token_index=None if token is None else locate_token(argv, token),
+            suggestion=None,
+            score=None,
+            label=None,
+            reason="permission failures are diagnoses, not spelling corrections",
+            evidence_source="recognized permission-error stderr rule",
+        )
+
+    return ErrorAnalysis(
+        category=ErrorCategory.UNKNOWN,
+        extracted_token=None,
+        token_index=None,
+        suggestion=None,
+        score=None,
+        label=None,
+        reason="no supported error pattern matched",
+        evidence_source="sanitized stderr pattern analysis",
+    )
+
+
 def display_token(token: str) -> str:
     """Render one argument unambiguously for display only."""
 
@@ -562,6 +993,45 @@ def display_argv(argv: tuple[str, ...] | list[str]) -> str:
     """Render an argument vector for review; the result is never executed."""
 
     return " ".join(display_token(token) for token in argv)
+
+
+def render_error_analysis(
+    analysis: ErrorAnalysis,
+    argv: list[str] | tuple[str, ...],
+) -> str:
+    """Render sanitized error evidence without repeating the raw stderr text."""
+
+    original = sanitized_argv(argv)
+    lines = [
+        "Error analysis:",
+        f"  Category: {analysis.category.value}",
+        f"  Extracted token: {analysis.extracted_token or '(none)'}",
+        f"  Evidence source: {analysis.evidence_source}",
+        f"  Reason: {analysis.reason}",
+    ]
+
+    if analysis.has_correction:
+        assert analysis.suggestion is not None
+        lines.extend(("", "Original:", f"  {display_argv(original)}"))
+        if analysis.token_index is not None and analysis.token_index < len(original):
+            suggested = list(original)
+            suggested[analysis.token_index] = analysis.suggestion
+            lines.extend(("", "Suggestion:", f"  {display_argv(suggested)}"))
+        else:
+            lines.extend(("", "Suggested token:", f"  {display_token(analysis.suggestion)}"))
+
+        lines.extend(("", "Correction evidence:"))
+        if analysis.resolved_evidence is not None:
+            lines.append(f"  - {analysis.resolved_evidence}")
+        if analysis.score is not None and analysis.label is not None:
+            lines.append(
+                f"  - Match: {analysis.score}/100 ({analysis.label.value})"
+            )
+    else:
+        lines.extend(("", "No reliable correction found."))
+
+    lines.extend(("", "Raw stderr was not repeated.", "Nothing was executed."))
+    return "\n".join(lines)
 
 
 def render_command_corrections(
@@ -636,6 +1106,7 @@ def check_command(
     env: dict[str, str] | None = None,
     windows: bool | None = None,
     cwd: str | os.PathLike[str] | Path | None = None,
+    error_text: str | None = None,
     output: object = sys.stdout,
 ) -> int:
     """Inspect executable and path tokens without executing the command."""
@@ -643,6 +1114,20 @@ def check_command(
     if not argv:
         print("termfix: no command was supplied", file=sys.stderr)
         return EXIT_USAGE
+
+    if error_text is not None:
+        if not error_text.strip():
+            print("termfix: --error-text cannot be empty", file=sys.stderr)
+            return EXIT_USAGE
+        analysis = analyze_error_message(
+            error_text,
+            argv,
+            env=env,
+            windows=windows,
+            cwd=cwd,
+        )
+        print(render_error_analysis(analysis, argv), file=output)
+        return EXIT_CORRECTION if analysis.has_correction else EXIT_NOT_FOUND
 
     original = argv[0]
     resolved = command_exists(original, env)
@@ -709,6 +1194,11 @@ def make_parser() -> argparse.ArgumentParser:
     actions = parser.add_subparsers(dest="action", required=True)
 
     check = actions.add_parser("check", help="inspect a command without executing it")
+    check.add_argument(
+        "--error-text",
+        metavar="TEXT",
+        help="analyze supplied stderr text without executing the command",
+    )
     check.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
     actions.add_parser("self-test", help="run the embedded standard-library tests")
@@ -730,7 +1220,10 @@ def cli(argv: list[str] | None = None) -> int:
     if args.action == "self-test":
         return run_tests()
     if args.action == "check":
-        return check_command(strip_separator(args.command))
+        return check_command(
+            strip_separator(args.command),
+            error_text=args.error_text,
+        )
     return EXIT_USAGE
 
 
@@ -1071,6 +1564,244 @@ class TermFixTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_NOT_FOUND)
         self.assertIn("No reliable path correction found", output.getvalue())
+
+    def test_argparse_invalid_choice_uses_explicit_allowed_choice(self) -> None:
+        error = (
+            "argument action: invalid choice: 'instal' "
+            "(choose from 'install', 'remove', 'update')"
+        )
+        analysis = analyze_error_message(error, ["tool", "instal"])
+
+        self.assertEqual(analysis.category, ErrorCategory.INVALID_CHOICE)
+        self.assertEqual(analysis.extracted_token, "instal")
+        self.assertEqual(analysis.token_index, 1)
+        self.assertEqual(analysis.suggestion, "install")
+        self.assertEqual(analysis.label, MatchLabel.HIGH)
+
+    def test_invalid_choice_rejects_weak_allowed_choices(self) -> None:
+        error = "invalid choice: 'unrelated' (choose from 'start', 'stop')"
+        analysis = analyze_error_message(error, ["tool", "unrelated"])
+
+        self.assertEqual(analysis.category, ErrorCategory.INVALID_CHOICE)
+        self.assertFalse(analysis.has_correction)
+
+    def test_git_explicit_subcommand_suggestion_is_recognized(self) -> None:
+        error = (
+            "git: 'statsu' is not a git command. See 'git --help'.\n\n"
+            "The most similar command is\n\tstatus"
+        )
+        analysis = analyze_error_message(error, ["git", "statsu"])
+
+        self.assertEqual(analysis.category, ErrorCategory.INVALID_CHOICE)
+        self.assertEqual(analysis.suggestion, "status")
+        self.assertEqual(analysis.token_index, 1)
+
+    def test_bash_command_not_found_uses_real_path_candidate(self) -> None:
+        candidate = ExecutableCandidate("python", "python.exe", "C:/Python/python.exe")
+        with mock.patch(
+            __name__ + ".discover_executables",
+            return_value=(candidate,),
+        ):
+            analysis = analyze_error_message(
+                "pyhton: command not found",
+                ["pyhton", "app.py"],
+                env={},
+                windows=True,
+            )
+
+        self.assertEqual(analysis.category, ErrorCategory.COMMAND_NOT_FOUND)
+        self.assertEqual(analysis.suggestion, "python")
+        self.assertEqual(analysis.resolved_evidence, "C:/Python/python.exe")
+
+    def test_powershell_not_recognized_is_categorized(self) -> None:
+        error = (
+            "pyhton : The term 'pyhton' is not recognized as the name of a "
+            "cmdlet, function, script file, or operable program."
+        )
+        analysis = analyze_error_message(error, ["pyhton"], env={})
+
+        self.assertEqual(analysis.category, ErrorCategory.COMMAND_NOT_FOUND)
+        self.assertEqual(analysis.extracted_token, "pyhton")
+
+    def test_cmd_not_recognized_is_categorized(self) -> None:
+        error = (
+            "'pyhton' is not recognized as an internal or external command, "
+            "operable program or batch file."
+        )
+        analysis = analyze_error_message(error, ["pyhton"], env={})
+
+        self.assertEqual(analysis.category, ErrorCategory.COMMAND_NOT_FOUND)
+
+    def test_generic_executable_not_recognized_is_categorized(self) -> None:
+        analysis = analyze_error_message(
+            "executable 'pyhton' was not recognized",
+            ["pyhton"],
+            env={},
+        )
+
+        self.assertEqual(analysis.category, ErrorCategory.COMMAND_NOT_FOUND)
+
+    def test_python_cannot_open_file_uses_local_path_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            expected = root / "main.py"
+            expected.write_text("unchanged", encoding="utf-8")
+            analysis = analyze_error_message(
+                "python: can't open file 'mian.py': [Errno 2] No such file or directory",
+                ["python", "mian.py"],
+                cwd=root,
+            )
+            content_after = expected.read_text(encoding="utf-8")
+
+        self.assertEqual(analysis.category, ErrorCategory.FILE_NOT_FOUND)
+        self.assertEqual(analysis.suggestion, "main.py")
+        self.assertEqual(Path(analysis.resolved_evidence or ""), expected)
+        self.assertEqual(content_after, "unchanged")
+
+    def test_file_not_found_error_pattern_is_recognized(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "settings.json").write_text("{}", encoding="utf-8")
+            analysis = analyze_error_message(
+                "FileNotFoundError: [Errno 2] No such file or directory: 'setings.json'",
+                ["python", "setings.json"],
+                cwd=root,
+            )
+
+        self.assertEqual(analysis.category, ErrorCategory.FILE_NOT_FOUND)
+        self.assertEqual(analysis.suggestion, "settings.json")
+
+    def test_missing_file_without_neighbor_has_no_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            analysis = analyze_error_message(
+                "No such file or directory: 'unrelated-file.xyz'",
+                ["tool", "unrelated-file.xyz"],
+                cwd=folder,
+            )
+
+        self.assertEqual(analysis.category, ErrorCategory.FILE_NOT_FOUND)
+        self.assertFalse(analysis.has_correction)
+
+    def test_module_not_found_uses_standard_library_names(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            analysis = analyze_error_message(
+                "ModuleNotFoundError: No module named 'josn'",
+                ["python", "-m", "josn"],
+                cwd=folder,
+            )
+
+        self.assertEqual(analysis.category, ErrorCategory.MODULE_NOT_FOUND)
+        self.assertEqual(analysis.suggestion, "json")
+        self.assertEqual(analysis.resolved_evidence, "Python standard library")
+
+    def test_module_not_found_uses_neighboring_local_module(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "helpers.py").write_text("", encoding="utf-8")
+            analysis = analyze_error_message(
+                "No module named 'hlepers'",
+                ["python", "-m", "hlepers"],
+                cwd=root,
+            )
+
+        self.assertEqual(analysis.category, ErrorCategory.MODULE_NOT_FOUND)
+        self.assertEqual(analysis.suggestion, "helpers")
+        self.assertIn("local module", analysis.resolved_evidence or "")
+
+    def test_unrecognized_argument_without_evidence_is_not_guessed(self) -> None:
+        analysis = analyze_error_message(
+            "tool: error: unrecognized arguments: --verison",
+            ["tool", "--verison"],
+        )
+
+        self.assertEqual(analysis.category, ErrorCategory.UNRECOGNIZED_ARGUMENT)
+        self.assertFalse(analysis.has_correction)
+
+    def test_unrecognized_argument_accepts_explicit_suggestion(self) -> None:
+        analysis = analyze_error_message(
+            "unrecognized argument: --verison. Did you mean --version?",
+            ["tool", "--verison"],
+        )
+
+        self.assertEqual(analysis.category, ErrorCategory.UNRECOGNIZED_ARGUMENT)
+        self.assertEqual(analysis.suggestion, "--version")
+
+    def test_permission_denied_is_diagnosed_without_spelling_guess(self) -> None:
+        analysis = analyze_error_message(
+            "PermissionError: [Errno 13] Permission denied: 'private.txt'",
+            ["tool", "private.txt"],
+        )
+
+        self.assertEqual(analysis.category, ErrorCategory.PERMISSION_DENIED)
+        self.assertEqual(analysis.extracted_token, "private.txt")
+        self.assertFalse(analysis.has_correction)
+        self.assertIn("diagnoses", analysis.reason)
+
+    def test_unknown_error_is_returned_without_guessing(self) -> None:
+        analysis = analyze_error_message("something unusual happened", ["tool"])
+
+        self.assertEqual(analysis.category, ErrorCategory.UNKNOWN)
+        self.assertFalse(analysis.has_correction)
+
+    def test_rendered_error_does_not_repeat_raw_secret(self) -> None:
+        raw_error = "unrecognized arguments: --token=super-secret-value"
+        analysis = analyze_error_message(
+            raw_error,
+            ["tool", "--token=super-secret-value"],
+        )
+        rendered = render_error_analysis(
+            analysis,
+            ["tool", "--token=super-secret-value"],
+        )
+
+        self.assertNotIn("super-secret-value", analysis.extracted_token or "")
+        self.assertNotIn(raw_error, rendered)
+        self.assertIn("<redacted>", rendered)
+        self.assertIn("Raw stderr was not repeated", rendered)
+
+    def test_corrected_error_output_redacts_separate_sensitive_value(self) -> None:
+        error = "invalid choice: 'instal' (choose from 'install', 'remove')"
+        argv = ["tool", "instal", "--token", "super-secret-value"]
+        analysis = analyze_error_message(error, argv)
+        rendered = render_error_analysis(analysis, argv)
+
+        self.assertTrue(analysis.has_correction)
+        self.assertNotIn("super-secret-value", rendered)
+        self.assertIn("--token <redacted>", rendered)
+
+    def test_error_check_returns_three_without_preflight_execution(self) -> None:
+        output = self._output()
+        error = "invalid choice: 'instal' (choose from 'install', 'remove')"
+        with mock.patch(
+            __name__ + ".command_exists",
+            side_effect=AssertionError("preflight must not run"),
+        ):
+            code = check_command(
+                ["tool", "instal"],
+                error_text=error,
+                output=output,
+            )
+
+        self.assertEqual(code, EXIT_CORRECTION)
+        self.assertIn("tool install", output.getvalue())
+        self.assertIn("Nothing was executed", output.getvalue())
+
+    def test_recognized_error_without_correction_returns_one(self) -> None:
+        output = self._output()
+        code = check_command(
+            ["tool", "--unknown"],
+            error_text="unrecognized arguments: --unknown",
+            output=output,
+        )
+
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertIn("No reliable correction found", output.getvalue())
+
+    def test_empty_error_text_returns_usage(self) -> None:
+        self.assertEqual(
+            check_command(["tool"], error_text="  ", output=self._output()),
+            EXIT_USAGE,
+        )
 
     def test_check_has_no_execution_module(self) -> None:
         self.assertNotIn("subprocess", globals())
