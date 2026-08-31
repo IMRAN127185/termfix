@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-11: proof-backed correction and a portable terminal assistant.
+"""TermFix Steps 2-12: proof-backed correction and a portable terminal assistant.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
@@ -12,6 +12,8 @@ The interactive prompt retains these guarantees while accepting repeated command
 Portable builds are deterministic, and environment diagnostics remain read-only.
 Safe demo and acceptance modes exercise the backend without launching user commands.
 PowerShell activation is explicit, session-only, and generated without shell execution.
+Interpreter-option corrections use small built-in profiles and never execute discovery code.
+Optional ANSI styling improves scanning while plain text retains every meaning.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ import zipfile
 
 
 APP_NAME = "TermFix"
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -62,6 +64,7 @@ BUILD_SCHEMA_VERSION = 1
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MINIMUM_PYTHON = (3, 13)
 TARGET_PYTHON = "3.14.7"
+PYTHON_OPTION_PROFILE_VERSION = 1
 
 
 class MatchLabel(str, Enum):
@@ -144,6 +147,47 @@ class DoctorStatus(str, Enum):
     OK = "OK"
     WARN = "WARN"
     FAIL = "FAIL"
+
+
+class ColorMode(str, Enum):
+    """User-selectable ANSI styling modes for human-facing terminal output."""
+
+    AUTO = "auto"
+    ALWAYS = "always"
+    NEVER = "never"
+
+
+@dataclass(frozen=True)
+class TerminalStyle:
+    """ANSI styles that degrade to the original plain text when disabled."""
+
+    enabled: bool = False
+
+    def apply(self, text: str, *codes: str) -> str:
+        if not self.enabled or not codes:
+            return text
+        return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+    def bold(self, text: str) -> str:
+        return self.apply(text, "1")
+
+    def dim(self, text: str) -> str:
+        return self.apply(text, "2")
+
+    def cyan(self, text: str) -> str:
+        return self.apply(text, "36")
+
+    def green(self, text: str) -> str:
+        return self.apply(text, "32")
+
+    def yellow(self, text: str) -> str:
+        return self.apply(text, "33")
+
+    def red(self, text: str) -> str:
+        return self.apply(text, "31")
+
+    def blue(self, text: str) -> str:
+        return self.apply(text, "34")
 
 
 RISK_PRIORITY = {
@@ -401,6 +445,21 @@ class PathCorrection:
 
 
 @dataclass(frozen=True)
+class SemanticCorrection:
+    """A correction proven by a small built-in command-option profile."""
+
+    token_index: int
+    original_token: str
+    suggested_token: str
+    command: str
+    role: str
+    score: int
+    label: MatchLabel
+    reason: str
+    evidence: str
+
+
+@dataclass(frozen=True)
 class ErrorAnalysis:
     """Structured, sanitized evidence extracted from an error message."""
 
@@ -494,6 +553,7 @@ class PreflightAnalysis:
     resolved_executable: str | None
     executable_correction: Correction | None
     path_corrections: tuple[PathCorrection, ...]
+    semantic_corrections: tuple[SemanticCorrection, ...]
     unresolved_paths: tuple[tuple[int, str], ...]
     original_safety: SafetyAssessment
     suggested_safety: SafetyAssessment
@@ -506,11 +566,16 @@ class PreflightAnalysis:
 
     @property
     def correction_count(self) -> int:
-        return int(self.executable_correction is not None) + len(self.path_corrections)
+        return (
+            int(self.executable_correction is not None)
+            + len(self.path_corrections)
+            + len(self.semantic_corrections)
+        )
 
     @property
     def match_label(self) -> MatchLabel | None:
         labels = [correction.label for correction in self.path_corrections]
+        labels.extend(correction.label for correction in self.semantic_corrections)
         if self.executable_correction is not None:
             labels.append(self.executable_correction.label)
         if not labels:
@@ -1786,6 +1851,76 @@ def inspect_path_arguments(
     return tuple(corrections), tuple(unresolved)
 
 
+def is_python_interpreter_command(token: str) -> bool:
+    """Recognize Python interpreters without consulting packages or the network."""
+
+    name = normalized_tool_name(token)
+    return name == "py" or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", name) is not None
+
+
+def find_python_option_correction(
+    argv: list[str] | tuple[str, ...],
+    *,
+    executable_token: str | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> SemanticCorrection | None:
+    """Correct a strong first-argument match to a safe Python information option."""
+
+    command = tuple(str(token) for token in argv)
+    if len(command) < 2:
+        return None
+    executable = executable_token or command[0]
+    if not is_python_interpreter_command(executable):
+        return None
+
+    token = command[1]
+    if token in {"--version", "--help", "-V", "-VV", "-h"}:
+        return None
+    if not re.fullmatch(r"-*[A-Za-z]+", token):
+        return None
+
+    working_directory = Path.cwd() if cwd is None else Path(cwd)
+    if safe_path_exists(local_path(token, working_directory)):
+        return None
+
+    option_word = token.lstrip("-")
+    if not option_word:
+        return None
+    candidates = (("--help", "help"), ("--version", "version"))
+    ranked: list[tuple[int, str, str, str]] = []
+    minimum_score = MINIMUM_MATCH_SCORE if token.startswith("-") else HIGH_MATCH_SCORE
+    for canonical, word in candidates:
+        score, reason = similarity_score(option_word, word)
+        if score < minimum_score:
+            continue
+        ranked.append((-score, canonical, reason, word))
+    if not ranked:
+        return None
+
+    negative_score, canonical, reason, word = sorted(ranked)[0]
+    score = -negative_score
+    if not token.startswith("-"):
+        reason = (
+            f"{reason}; recognized Python information option is missing its -- prefix"
+        )
+    elif option_word.casefold() == word.casefold():
+        reason = "recognized Python information option has a non-canonical prefix"
+    return SemanticCorrection(
+        token_index=1,
+        original_token=token,
+        suggested_token=canonical,
+        command=normalized_tool_name(executable),
+        role="Python interpreter information option",
+        score=score,
+        label=match_label(score),
+        reason=reason,
+        evidence=(
+            f"built-in Python option profile v{PYTHON_OPTION_PROFILE_VERSION}: "
+            f"{canonical} displays interpreter information"
+        ),
+    )
+
+
 def locate_token(argv: list[str] | tuple[str, ...], token: str) -> int | None:
     """Locate an error token in the original argument vector deterministically."""
 
@@ -2733,7 +2868,7 @@ def assess_command_safety(argv: list[str] | tuple[str, ...]) -> SafetyAssessment
                 "the recognized command only displays information",
                 f"executable token: {executable}",
             )
-        elif executable in {"py", "python", "python3"} and command[1:] in {
+        elif is_python_interpreter_command(executable) and command[1:] in {
             ("--help",),
             ("--version",),
             ("-h",),
@@ -2746,7 +2881,7 @@ def assess_command_safety(argv: list[str] | tuple[str, ...]) -> SafetyAssessment
                 "this Python option only displays interpreter information",
                 f"Python option: {command[1]}",
             )
-        elif executable in CODE_EXECUTORS:
+        elif executable in CODE_EXECUTORS or is_python_interpreter_command(executable):
             add(
                 RiskLevel.MEDIUM,
                 "code-execution-possible",
@@ -2803,7 +2938,11 @@ def execution_blocking_findings(
 def display_token(token: str) -> str:
     """Render one argument unambiguously for display only."""
 
-    if token and not any(character.isspace() or character in "\"'" for character in token):
+    if (
+        token
+        and all(character.isprintable() for character in token)
+        and not any(character.isspace() or character in "\"'" for character in token)
+    ):
         return token
     return json.dumps(token, ensure_ascii=False)
 
@@ -2814,10 +2953,79 @@ def display_argv(argv: tuple[str, ...] | list[str]) -> str:
     return " ".join(display_token(token) for token in argv)
 
 
+def color_is_enabled(
+    mode: str | ColorMode,
+    output: object,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
+    """Decide whether ANSI styling is safe and requested for this output stream."""
+
+    environment = selected_environment(env)
+    if environment_value(environment, "NO_COLOR") is not None:
+        return False
+    selected_mode = mode if isinstance(mode, ColorMode) else ColorMode(str(mode))
+    if selected_mode is ColorMode.NEVER:
+        return False
+    if selected_mode is ColorMode.ALWAYS:
+        return True
+    if (environment_value(environment, "TERM") or "").casefold() == "dumb":
+        return False
+    isatty = getattr(output, "isatty", None)
+    try:
+        return bool(isatty()) if callable(isatty) else False
+    except (OSError, ValueError):
+        return False
+
+
+def terminal_style(
+    output: object,
+    *,
+    mode: str | ColorMode = ColorMode.AUTO,
+    env: dict[str, str] | None = None,
+) -> TerminalStyle:
+    """Create a terminal style without changing console or process state."""
+
+    return TerminalStyle(color_is_enabled(mode, output, env=env))
+
+
+def styled_argv(
+    argv: tuple[str, ...] | list[str],
+    comparison: tuple[str, ...] | list[str],
+    *,
+    style: TerminalStyle,
+    changed_color: str,
+) -> str:
+    """Render argument tokens and emphasize only positions that changed."""
+
+    safe_argv = sanitized_argv(argv)
+    safe_comparison = sanitized_argv(comparison)
+    rendered: list[str] = []
+    for index, token in enumerate(safe_argv):
+        text = display_token(token)
+        other = safe_comparison[index] if index < len(safe_comparison) else None
+        if token != other:
+            painter = getattr(style, changed_color)
+            text = style.bold(painter(text))
+        rendered.append(text)
+    return " ".join(rendered)
+
+
+def styled_risk(level: RiskLevel, style: TerminalStyle) -> str:
+    """Color a risk word while retaining its explicit text label."""
+
+    if level is RiskLevel.HIGH:
+        return style.bold(style.red(level.value))
+    if level is RiskLevel.MEDIUM:
+        return style.bold(style.yellow(level.value))
+    return style.bold(style.green(level.value))
+
+
 def render_safety_assessment(
     assessment: SafetyAssessment,
     *,
     footer: str = "Nothing was executed.",
+    style: TerminalStyle | None = None,
 ) -> str:
     """Render a safety label and the exact deterministic evidence behind it."""
 
@@ -2826,11 +3034,12 @@ def render_safety_assessment(
         if assessment.blocked
         else "REVIEW - this classification does not execute or approve the command."
     )
+    active_style = style or TerminalStyle()
     lines = [
-        "Safety assessment:",
-        f"  Risk: {assessment.level.value}",
-        f"  Decision: {decision}",
-        "  Evidence:",
+        active_style.bold(active_style.cyan("Safety assessment:")),
+        f"  Risk: {styled_risk(assessment.level, active_style)}",
+        f"  Decision: {active_style.bold(decision)}",
+        active_style.bold("  Evidence:"),
     ]
     for finding in assessment.findings:
         lines.extend(
@@ -2851,18 +3060,21 @@ def render_safety_assessment(
 def render_blocked_correction(
     original: SafetyAssessment,
     suggested: SafetyAssessment,
+    *,
+    style: TerminalStyle | None = None,
 ) -> str:
     """Explain why a risk-increasing correction was withheld."""
 
     blocking_reasons = tuple(
         finding for finding in suggested.findings if finding.level is suggested.level
     )
+    active_style = style or TerminalStyle()
     lines = [
-        "Correction blocked:",
+        active_style.bold(active_style.red("Correction blocked:")),
         "  A proposed correction was withheld because it increased command risk.",
-        f"  Original risk: {original.level.value}",
-        f"  Proposed risk: {suggested.level.value}",
-        "  Blocking evidence:",
+        f"  Original risk: {styled_risk(original.level, active_style)}",
+        f"  Proposed risk: {styled_risk(suggested.level, active_style)}",
+        active_style.bold("  Blocking evidence:"),
     ]
     for finding in blocking_reasons:
         lines.extend(
@@ -2879,6 +3091,7 @@ def corrected_argv(
     argv: list[str] | tuple[str, ...],
     executable_correction: Correction | None,
     path_corrections: tuple[PathCorrection, ...],
+    semantic_corrections: tuple[SemanticCorrection, ...] = (),
 ) -> tuple[str, ...]:
     """Apply proven token replacements to an in-memory argument vector."""
 
@@ -2886,6 +3099,8 @@ def corrected_argv(
     if executable_correction is not None:
         suggested[0] = executable_correction.suggested_token
     for correction in path_corrections:
+        suggested[correction.token_index] = correction.suggested_token
+    for correction in semantic_corrections:
         suggested[correction.token_index] = correction.suggested_token
     return tuple(suggested)
 
@@ -2916,7 +3131,52 @@ def prepare_preflight(
     if original and resolved is None:
         executable_correction = find_correction(original, env, windows=windows)
     path_corrections, unresolved_paths = inspect_path_arguments(original, cwd=cwd)
-    suggestion = corrected_argv(original, executable_correction, path_corrections)
+    effective_executable = (
+        executable_correction.suggested_token
+        if executable_correction is not None
+        else (original[0] if original else None)
+    )
+    semantic_correction = find_python_option_correction(
+        original,
+        executable_token=effective_executable,
+        cwd=cwd,
+    )
+    semantic_corrections: tuple[SemanticCorrection, ...] = ()
+    if semantic_correction is not None:
+        corrected_indices = {item.token_index for item in path_corrections}
+        if semantic_correction.token_index not in corrected_indices:
+            competing_path = find_path_correction(
+                semantic_correction.original_token,
+                semantic_correction.token_index,
+                cwd=cwd,
+                assume_path=True,
+            )
+            if (
+                competing_path is not None
+                and competing_path.score >= semantic_correction.score
+            ):
+                path_corrections = tuple(
+                    sorted(
+                        (*path_corrections, competing_path),
+                        key=lambda item: item.token_index,
+                    )
+                )
+            else:
+                semantic_corrections = (semantic_correction,)
+
+    corrected_indices = {
+        correction.token_index
+        for correction in (*path_corrections, *semantic_corrections)
+    }
+    unresolved_paths = tuple(
+        item for item in unresolved_paths if item[0] not in corrected_indices
+    )
+    suggestion = corrected_argv(
+        original,
+        executable_correction,
+        path_corrections,
+        semantic_corrections,
+    )
     original_safety = assess_command_safety(original)
     suggested_safety = assess_command_safety(suggestion)
     risk_increased = (
@@ -2929,6 +3189,7 @@ def prepare_preflight(
         resolved_executable=resolved,
         executable_correction=executable_correction,
         path_corrections=path_corrections,
+        semantic_corrections=semantic_corrections,
         unresolved_paths=unresolved_paths,
         original_safety=original_safety,
         suggested_safety=suggested_safety,
@@ -2945,20 +3206,35 @@ def render_compact_correction(
     label: MatchLabel,
     safety: SafetyAssessment,
     indicator: str = "[i]",
+    style: TerminalStyle | None = None,
 ) -> str:
     """Render the small approval view used before corrected execution."""
 
+    active_style = style or TerminalStyle()
     noun = "correction" if correction_count == 1 else "corrections"
+    original_line = styled_argv(
+        original,
+        suggested,
+        style=active_style,
+        changed_color="yellow",
+    )
+    suggestion_line = styled_argv(
+        suggested,
+        original,
+        style=active_style,
+        changed_color="green",
+    )
     return "\n".join(
         (
-            "Original:",
-            f"  {display_argv(sanitized_argv(original))}",
+            active_style.bold(active_style.cyan("Original:")),
+            f"  {active_style.dim(original_line)}",
             "",
-            "Suggestion:",
-            f"  {display_argv(sanitized_argv(suggested))}  {indicator}",
+            active_style.bold(active_style.cyan("Suggestion:")),
+            f"  {suggestion_line}  {active_style.cyan(indicator)}",
             "",
-            f"{correction_count} {noun} | Match: {label.value} | "
-            f"Risk: {safety.level.value}",
+            f"{active_style.bold(str(correction_count))} {noun} | "
+            f"Match: {active_style.bold(label.value)} | "
+            f"Risk: {styled_risk(safety.level, active_style)}",
         )
     )
 
@@ -2977,12 +3253,15 @@ def information_indicator(output: object = sys.stdout) -> str:
 def render_token_diff(
     original: tuple[str, ...] | list[str],
     suggested: tuple[str, ...] | list[str],
+    *,
+    style: TerminalStyle | None = None,
 ) -> str:
     """Render changed argument positions without constructing shell text."""
 
     safe_original = sanitized_argv(original)
     safe_suggested = sanitized_argv(suggested)
-    lines = ["Token diff:"]
+    active_style = style or TerminalStyle()
+    lines = [active_style.bold(active_style.cyan("Token diff:"))]
     width = max(len(safe_original), len(safe_suggested))
     changes = 0
     for index in range(width):
@@ -2990,7 +3269,8 @@ def render_token_diff(
         after = safe_suggested[index] if index < len(safe_suggested) else "(missing)"
         if before != after:
             lines.append(
-                f"  [{index}] {display_token(before)} -> {display_token(after)}"
+                f"  [{index}] {active_style.yellow(display_token(before))} -> "
+                f"{active_style.green(display_token(after))}"
             )
             changes += 1
     if changes == 0:
@@ -3001,13 +3281,16 @@ def render_token_diff(
 def render_execution_block(
     assessment: SafetyAssessment,
     blockers: tuple[SafetyFinding, ...],
+    *,
+    style: TerminalStyle | None = None,
 ) -> str:
     """Render exact reasons why the run action refused a command."""
 
+    active_style = style or TerminalStyle()
     lines = [
-        "Execution blocked:",
-        f"  Risk: {assessment.level.value}",
-        "  Blocking evidence:",
+        active_style.bold(active_style.red("Execution blocked:")),
+        f"  Risk: {styled_risk(assessment.level, active_style)}",
+        active_style.bold("  Blocking evidence:"),
     ]
     for finding in blockers:
         lines.extend(
@@ -3031,9 +3314,11 @@ def request_correction_approval(
     input_fn: object | None = None,
     interactive: bool | None = None,
     output: object = sys.stdout,
+    style: TerminalStyle | None = None,
 ) -> bool:
     """Require an explicit y while offering explanation and token diff views."""
 
+    active_style = style or TerminalStyle()
     print(
         render_compact_correction(
             original,
@@ -3042,6 +3327,7 @@ def request_correction_approval(
             label=label,
             safety=safety,
             indicator=information_indicator(output),
+            style=active_style,
         ),
         file=output,
     )
@@ -3057,9 +3343,17 @@ def request_correction_approval(
     reader = input if input_fn is None else input_fn
     while True:
         print("", file=output)
-        print("[y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel", file=output)
+        choices = "   ".join(
+            (
+                f"{active_style.green('[y]')} Run",
+                f"{active_style.blue('[e]')} Explain",
+                f"{active_style.cyan('[d]')} Diff",
+                f"{active_style.yellow('[Enter/n]')} Cancel",
+            )
+        )
+        print(choices, file=output)
         try:
-            choice = reader("Choice: ").strip().casefold()
+            choice = reader(active_style.bold("Choice: ")).strip().casefold()
         except EOFError:
             choice = ""
         if choice in {"y", "yes"}:
@@ -3073,7 +3367,7 @@ def request_correction_approval(
             continue
         if choice in {"d", "diff"}:
             print("", file=output)
-            print(render_token_diff(original, suggested), file=output)
+            print(render_token_diff(original, suggested, style=active_style), file=output)
             continue
         print("Choose y, e, d, n, or press Enter to cancel.", file=output)
 
@@ -3124,10 +3418,13 @@ def render_command_corrections(
     executable_correction: Correction | None,
     path_corrections: tuple[PathCorrection, ...],
     *,
+    semantic_corrections: tuple[SemanticCorrection, ...] = (),
     unresolved: tuple[str, ...] = (),
+    style: TerminalStyle | None = None,
 ) -> str:
-    """Render executable and path corrections as one auditable suggestion."""
+    """Render all proof-backed corrections as one auditable suggestion."""
 
+    active_style = style or TerminalStyle()
     original = tuple(str(token) for token in argv)
     suggested = list(original)
     evidence: list[str] = []
@@ -3163,16 +3460,29 @@ def render_command_corrections(
             )
         )
 
+    for correction in semantic_corrections:
+        suggested[correction.token_index] = correction.suggested_token
+        evidence.extend(
+            (
+                f"  - Token {correction.token_index} ({correction.role}): "
+                f"{correction.original_token} -> {correction.suggested_token}",
+                f"    Source: {correction.evidence}",
+                f"    Command profile: {correction.command}",
+                f"    Reason: {correction.reason}",
+                f"    Match: {correction.score}/100 ({correction.label.value})",
+            )
+        )
+
     display_original = sanitized_argv(original)
     display_suggested = sanitized_argv(suggested)
     lines = [
-        "Original:",
-        f"  {display_argv(display_original)}",
+        active_style.bold(active_style.cyan("Original:")),
+        f"  {active_style.dim(styled_argv(display_original, display_suggested, style=active_style, changed_color='yellow'))}",
         "",
-        "Suggestion:",
-        f"  {display_argv(display_suggested)}",
+        active_style.bold(active_style.cyan("Suggestion:")),
+        f"  {styled_argv(display_suggested, display_original, style=active_style, changed_color='green')}",
         "",
-        "Evidence:",
+        active_style.bold("Evidence:"),
         *evidence,
     ]
     if unresolved:
@@ -3195,9 +3505,11 @@ def check_command(
     cwd: str | os.PathLike[str] | Path | None = None,
     error_text: str | None = None,
     output: object = sys.stdout,
+    style: TerminalStyle | None = None,
 ) -> int:
     """Inspect executable and path tokens without executing the command."""
 
+    active_style = style or TerminalStyle()
     if not argv:
         print("termfix: no command was supplied", file=sys.stderr)
         return EXIT_USAGE
@@ -3233,77 +3545,86 @@ def check_command(
                 return EXIT_BLOCKED
             print(render_error_analysis(analysis, argv), file=output)
             print("", file=output)
-            print(render_safety_assessment(suggested_safety), file=output)
+            print(
+                render_safety_assessment(suggested_safety, style=active_style),
+                file=output,
+            )
             return EXIT_BLOCKED if suggested_safety.blocked else EXIT_CORRECTION
 
         print(render_error_analysis(analysis, argv), file=output)
         return EXIT_CORRECTION if analysis.has_correction else EXIT_NOT_FOUND
 
+    preflight = prepare_preflight(argv, env=env, windows=windows, cwd=cwd)
     original = argv[0]
-    resolved = command_exists(original, env)
-    executable_correction = None
-    if resolved is None:
-        executable_correction = find_correction(argv, env, windows=windows)
-
-    path_corrections, unresolved_paths = inspect_path_arguments(argv, cwd=cwd)
-    if executable_correction is not None or path_corrections:
-        suggestion = corrected_argv(argv, executable_correction, path_corrections)
-        allowed, original_safety, suggested_safety = correction_preserves_risk(
-            argv,
-            suggestion,
-        )
-        if not allowed:
+    if preflight.has_correction:
+        if preflight.risk_increased:
             print(
-                render_blocked_correction(original_safety, suggested_safety),
+                render_blocked_correction(
+                    preflight.original_safety,
+                    preflight.suggested_safety,
+                    style=active_style,
+                ),
                 file=output,
             )
             return EXIT_BLOCKED
 
         unresolved_messages = []
-        if resolved is None and executable_correction is None:
+        if (
+            preflight.resolved_executable is None
+            and preflight.executable_correction is None
+        ):
             unresolved_messages.append(
                 f"Executable {original!r} was not found and has no reliable correction."
             )
         unresolved_messages.extend(
             f"Path token {index} {token!r} was not found and has no reliable correction."
-            for index, token in unresolved_paths
+            for index, token in preflight.unresolved_paths
         )
         print(
             render_command_corrections(
                 argv,
-                executable_correction,
-                path_corrections,
+                preflight.executable_correction,
+                preflight.path_corrections,
+                semantic_corrections=preflight.semantic_corrections,
                 unresolved=tuple(unresolved_messages),
+                style=active_style,
             ),
             file=output,
         )
         print("", file=output)
-        print(render_safety_assessment(suggested_safety), file=output)
-        return EXIT_BLOCKED if suggested_safety.blocked else EXIT_CORRECTION
+        print(
+            render_safety_assessment(preflight.suggested_safety, style=active_style),
+            file=output,
+        )
+        return (
+            EXIT_BLOCKED
+            if preflight.suggested_safety.blocked
+            else EXIT_CORRECTION
+        )
 
-    if resolved is None:
-        safety = assess_command_safety(argv)
+    if preflight.resolved_executable is None:
+        safety = preflight.original_safety
         print(f"Executable not found: {original}", file=output)
         print("No reliable correction found. Nothing was executed.", file=output)
         print("", file=output)
-        print(render_safety_assessment(safety), file=output)
+        print(render_safety_assessment(safety, style=active_style), file=output)
         return EXIT_BLOCKED if safety.blocked else EXIT_NOT_FOUND
 
-    if unresolved_paths:
-        safety = assess_command_safety(argv)
-        for index, token in unresolved_paths:
+    if preflight.unresolved_paths:
+        safety = preflight.original_safety
+        for index, token in preflight.unresolved_paths:
             print(f"Path not found at token {index}: {token}", file=output)
         print("No reliable path correction found. Nothing was executed.", file=output)
         print("", file=output)
-        print(render_safety_assessment(safety), file=output)
+        print(render_safety_assessment(safety, style=active_style), file=output)
         return EXIT_BLOCKED if safety.blocked else EXIT_NOT_FOUND
 
-    safety = assess_command_safety(argv)
+    safety = preflight.original_safety
     print(f"Command exists: {original}", file=output)
-    print(f"Resolved executable: {resolved}", file=output)
+    print(f"Resolved executable: {preflight.resolved_executable}", file=output)
     print("No correction is required. Nothing was executed.", file=output)
     print("", file=output)
-    print(render_safety_assessment(safety), file=output)
+    print(render_safety_assessment(safety, style=active_style), file=output)
     return EXIT_BLOCKED if safety.blocked else EXIT_OK
 
 
@@ -3311,17 +3632,19 @@ def safety_command(
     argv: list[str],
     *,
     output: object = sys.stdout,
+    style: TerminalStyle | None = None,
 ) -> int:
     """Display a read-only safety classification for a supplied command."""
 
+    active_style = style or TerminalStyle()
     if not argv:
         print("termfix: no command was supplied", file=sys.stderr)
         return EXIT_USAGE
     assessment = assess_command_safety(argv)
-    print("Command:", file=output)
+    print(active_style.bold(active_style.cyan("Command:")), file=output)
     print(f"  {display_argv(sanitized_argv(argv))}", file=output)
     print("", file=output)
-    print(render_safety_assessment(assessment), file=output)
+    print(render_safety_assessment(assessment, style=active_style), file=output)
     return EXIT_BLOCKED if assessment.blocked else EXIT_OK
 
 
@@ -3393,9 +3716,11 @@ def run_command(
     runner: object | None = None,
     output: object = sys.stdout,
     error_output: object = sys.stderr,
+    style: TerminalStyle | None = None,
 ) -> int:
     """Preflight, optionally approve, and execute one shell-free command."""
 
+    active_style = style or TerminalStyle()
     if not argv:
         print("termfix: no command was supplied", file=error_output)
         return EXIT_USAGE
@@ -3411,6 +3736,7 @@ def run_command(
             render_blocked_correction(
                 preflight.original_safety,
                 preflight.suggested_safety,
+                style=active_style,
             ),
             file=output,
         )
@@ -3419,7 +3745,11 @@ def run_command(
     blockers = execution_blocking_findings(preflight.suggested_safety)
     if blockers:
         print(
-            render_execution_block(preflight.suggested_safety, blockers),
+            render_execution_block(
+                preflight.suggested_safety,
+                blockers,
+                style=active_style,
+            ),
             file=output,
         )
         return EXIT_BLOCKED
@@ -3451,8 +3781,13 @@ def run_command(
                     preflight.original_argv,
                     preflight.executable_correction,
                     preflight.path_corrections,
+                    semantic_corrections=preflight.semantic_corrections,
+                    style=active_style,
                 ),
-                render_safety_assessment(preflight.suggested_safety),
+                render_safety_assessment(
+                    preflight.suggested_safety,
+                    style=active_style,
+                ),
             )
         )
         approved = request_correction_approval(
@@ -3465,6 +3800,7 @@ def run_command(
             input_fn=input_fn,
             interactive=interactive,
             output=output,
+            style=active_style,
         )
         if not approved:
             return EXIT_CANCELLED
@@ -3532,11 +3868,25 @@ def run_command(
         retry_argv,
     )
     if not allowed:
-        print(render_blocked_correction(original_safety, retry_safety), file=output)
+        print(
+            render_blocked_correction(
+                original_safety,
+                retry_safety,
+                style=active_style,
+            ),
+            file=output,
+        )
         return EXIT_BLOCKED
     retry_blockers = execution_blocking_findings(retry_safety)
     if retry_blockers:
-        print(render_execution_block(retry_safety, retry_blockers), file=output)
+        print(
+            render_execution_block(
+                retry_safety,
+                retry_blockers,
+                style=active_style,
+            ),
+            file=output,
+        )
         return EXIT_BLOCKED
 
     retry_label = analysis.label or MatchLabel.MEDIUM
@@ -3550,6 +3900,7 @@ def run_command(
             render_safety_assessment(
                 retry_safety,
                 footer="No retry was executed during safety review.",
+                style=active_style,
             ),
         )
     )
@@ -3563,6 +3914,7 @@ def run_command(
         input_fn=input_fn,
         interactive=interactive,
         output=output,
+        style=active_style,
     )
     if not approved:
         return EXIT_CANCELLED
@@ -4648,6 +5000,25 @@ def run_acceptance_evaluation() -> AcceptanceReport:
             showcase=True,
         )
 
+        option_correction = prepare_preflight(
+            ("pythod", "vrsion"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Executable and Python option correction",
+            "Correction",
+            option_correction.suggested_argv == ("python", "--version")
+            and option_correction.correction_count == 2
+            and len(option_correction.semantic_corrections) == 1
+            and option_correction.suggested_safety.level is RiskLevel.LOW,
+            "pythod vrsion",
+            "python --version from PATH and the built-in Python option profile",
+            display_argv(option_correction.suggested_argv),
+            showcase=True,
+        )
+
         source_directory = root / "source"
         source_directory.mkdir()
         (source_directory / "main.py").write_text("print('nested')\n", encoding="utf-8")
@@ -4845,6 +5216,36 @@ def run_acceptance_evaluation() -> AcceptanceReport:
             "Unicode and ASCII-only terminal encodings",
             "ⓘ with [i] fallback",
             f"{unicode_indicator} / {ascii_indicator}",
+        )
+
+        styled_safety = assess_command_safety(("python", "--version"))
+        plain_interface = render_compact_correction(
+            ("python", "vrsion"),
+            ("python", "--version"),
+            correction_count=1,
+            label=MatchLabel.HIGH,
+            safety=styled_safety,
+            indicator="[i]",
+        )
+        colored_interface = render_compact_correction(
+            ("python", "vrsion"),
+            ("python", "--version"),
+            correction_count=1,
+            label=MatchLabel.HIGH,
+            safety=styled_safety,
+            indicator="[i]",
+            style=TerminalStyle(True),
+        )
+        color_stripped = re.sub(r"\033\[[0-9;]*m", "", colored_interface)
+        add(
+            "Color remains optional and meaning-preserving",
+            "Interface",
+            "\033[" not in plain_interface
+            and "\033[" in colored_interface
+            and color_stripped == plain_interface,
+            "plain and ANSI-styled correction views",
+            "identical words and labels after ANSI removal",
+            "plain fallback preserved" if color_stripped == plain_interface else "content changed",
         )
 
         interactive_output = io.StringIO()
@@ -5412,9 +5813,11 @@ def change_interactive_directory(
     input_fn: object,
     output: object,
     error_output: object,
+    style: TerminalStyle | None = None,
 ) -> Path:
     """Validate and optionally correct a cd target without changing process cwd."""
 
+    active_style = style or TerminalStyle()
     if len(argv) != 2:
         print("Usage: cd PATH", file=error_output)
         return current_directory
@@ -5467,6 +5870,7 @@ def change_interactive_directory(
         input_fn=input_fn,
         interactive=True,
         output=output,
+        style=active_style,
     )
     if not approved:
         return current_directory
@@ -5489,10 +5893,12 @@ def interactive_shell(
     runner: object | None = None,
     output: object = sys.stdout,
     error_output: object = sys.stderr,
+    color_mode: str | ColorMode = ColorMode.AUTO,
 ) -> int:
     """Run a continuous safe prompt while keeping all session state in memory."""
 
     reader = input if input_fn is None else input_fn
+    style = terminal_style(output, mode=color_mode, env=env)
     initial_directory = Path.cwd() if cwd is None else Path(cwd)
     try:
         current_directory = initial_directory.resolve(strict=True)
@@ -5503,13 +5909,13 @@ def interactive_shell(
         print(f"termfix: starting path is not a directory: {initial_directory}", file=error_output)
         return EXIT_USAGE
 
-    print(f"TermFix interactive terminal {VERSION}", file=output)
+    print(style.bold(style.cyan(f"TermFix interactive terminal {VERSION}")), file=output)
     print("Type help for commands or exit to return to the normal terminal.", file=output)
     print("Commands are parsed as arguments; no system shell is opened.", file=output)
 
     while True:
         try:
-            print("termfix> ", end="", file=output, flush=True)
+            print(style.bold(style.cyan("termfix> ")), end="", file=output, flush=True)
             line = reader("")
         except EOFError:
             print("", file=output)
@@ -5565,6 +5971,7 @@ def interactive_shell(
                 input_fn=reader,
                 output=output,
                 error_output=error_output,
+                style=style,
             )
             continue
 
@@ -5579,6 +5986,7 @@ def interactive_shell(
                 runner=runner,
                 output=output,
                 error_output=error_output,
+                style=style,
             )
         except KeyboardInterrupt:
             print("", file=output)
@@ -5598,7 +6006,19 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     actions = parser.add_subparsers(dest="action", required=True)
 
+    def add_color_argument(action_parser: argparse.ArgumentParser) -> None:
+        action_parser.add_argument(
+            "--color",
+            choices=tuple(mode.value for mode in ColorMode),
+            default=ColorMode.AUTO.value,
+            help=(
+                "ANSI styling: auto for terminals, always to force, or never; "
+                "NO_COLOR disables styling"
+            ),
+        )
+
     check = actions.add_parser("check", help="inspect a command without executing it")
+    add_color_argument(check)
     check.add_argument(
         "--error-text",
         metavar="TEXT",
@@ -5610,12 +6030,14 @@ def make_parser() -> argparse.ArgumentParser:
         "safety",
         help="classify command risk without executing it",
     )
+    add_color_argument(safety)
     safety.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
     run = actions.add_parser(
         "run",
         help="preflight and safely run a command",
     )
+    add_color_argument(run)
     run.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
     context = actions.add_parser(
@@ -5648,6 +6070,7 @@ def make_parser() -> argparse.ArgumentParser:
         "shell",
         help="open the continuous interactive TermFix terminal",
     )
+    add_color_argument(shell)
     shell.add_argument(
         "--cwd",
         metavar="DIRECTORY",
@@ -5703,11 +6126,18 @@ def cli(argv: list[str] | None = None) -> int:
         return check_command(
             strip_separator(args.command),
             error_text=args.error_text,
+            style=terminal_style(sys.stdout, mode=args.color),
         )
     if args.action == "safety":
-        return safety_command(strip_separator(args.command))
+        return safety_command(
+            strip_separator(args.command),
+            style=terminal_style(sys.stdout, mode=args.color),
+        )
     if args.action == "run":
-        return run_command(strip_separator(args.command))
+        return run_command(
+            strip_separator(args.command),
+            style=terminal_style(sys.stdout, mode=args.color),
+        )
     if args.action == "context":
         return context_command(
             strip_separator(args.command),
@@ -5717,7 +6147,7 @@ def cli(argv: list[str] | None = None) -> int:
             error_text=args.error_text,
         )
     if args.action == "shell":
-        return interactive_shell(cwd=args.cwd)
+        return interactive_shell(cwd=args.cwd, color_mode=args.color)
     if args.action == "build":
         return build_command()
     if args.action == "doctor":
@@ -7729,7 +8159,7 @@ class TermFixTests(unittest.TestCase):
             code = cli(["shell", "--cwd", "."])
 
         self.assertEqual(code, EXIT_OK)
-        shell.assert_called_once_with(cwd=".")
+        shell.assert_called_once_with(cwd=".", color_mode="auto")
 
     def test_portable_archive_is_reproducible_and_has_one_fixed_entry(self) -> None:
         source = b"from __future__ import annotations\nimport sys\nprint(sys.version)\n"
@@ -8240,7 +8670,7 @@ class TermFixTests(unittest.TestCase):
             report = run_acceptance_evaluation()
 
         self.assertTrue(report.successful)
-        self.assertEqual(report.passed, 18)
+        self.assertEqual(report.passed, 20)
         self.assertEqual(report.failed, 0)
         self.assertGreaterEqual(report.elapsed_ms, 0)
         self.assertEqual(
@@ -8275,8 +8705,8 @@ class TermFixTests(unittest.TestCase):
         for rendered in (rendered_evaluation, rendered_demo):
             self.assertNotIn("termfix-evaluation-", rendered)
             self.assertNotIn("evaluation-secret-value", rendered)
-        self.assertIn("18/18 acceptance cases passed", rendered_evaluation)
-        self.assertIn("7/7 scenarios passed", rendered_demo)
+        self.assertIn("20/20 acceptance cases passed", rendered_evaluation)
+        self.assertIn("8/8 scenarios passed", rendered_demo)
         self.assertIn("[i]", rendered_demo)
 
     def test_evaluation_command_reports_success_and_non_execution_guarantee(self) -> None:
@@ -8295,7 +8725,7 @@ class TermFixTests(unittest.TestCase):
         self.assertEqual(code, EXIT_OK)
         rendered = output.getvalue()
         self.assertIn("TermFix Safe Demo", rendered)
-        self.assertEqual(rendered.count("Scenario "), 7)
+        self.assertEqual(rendered.count("Scenario "), 8)
         self.assertIn("pyhton mian.py", rendered)
         self.assertIn("rm -rf /", rendered)
         self.assertIn("calcluate -> calculate", rendered)
@@ -8557,6 +8987,188 @@ class TermFixTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_OK)
         activate.assert_called_once_with(shell="powershell")
+
+    def test_python_bare_version_typo_uses_builtin_option_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            correction = find_python_option_correction(
+                ["python", "vrsion"],
+                cwd=folder,
+            )
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested_token, "--version")
+        self.assertEqual(correction.token_index, 1)
+        self.assertEqual(correction.label, MatchLabel.HIGH)
+        self.assertIn("built-in Python option profile", correction.evidence)
+
+    def test_prefixed_python_option_typo_is_corrected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            correction = find_python_option_correction(
+                ["python3.13", "--vrsion"],
+                cwd=folder,
+            )
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested_token, "--version")
+        self.assertEqual(
+            assess_command_safety(["python3.13", "--version"]).level,
+            RiskLevel.LOW,
+        )
+
+    def test_python_semantic_profile_does_not_guess_program_content(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cases = (
+                ["python", "calculate"],
+                ["python", "-m", "json"],
+                ["python", "-c", "print('ok')"],
+                ["node", "vrsion"],
+            )
+            observed = tuple(
+                find_python_option_correction(case, cwd=root) for case in cases
+            )
+
+        self.assertEqual(observed, (None, None, None, None))
+
+    def test_existing_local_file_wins_over_python_option_meaning(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "version").write_text("print('local')\n", encoding="utf-8")
+            exact = find_python_option_correction(["python", "version"], cwd=root)
+            with mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ):
+                preflight = prepare_preflight(["python", "vrsion"], cwd=root)
+
+        self.assertIsNone(exact)
+        self.assertEqual(preflight.semantic_corrections, ())
+        self.assertEqual(preflight.suggested_argv, ("python", "version"))
+        self.assertEqual(len(preflight.path_corrections), 1)
+
+    def test_combined_executable_and_python_option_typos_are_corrected(self) -> None:
+        candidate = ExecutableCandidate(
+            "python",
+            "python.exe",
+            "C:/Python/python.exe",
+        )
+        with tempfile.TemporaryDirectory() as folder, mock.patch(
+            __name__ + ".command_exists",
+            return_value=None,
+        ), mock.patch(
+            __name__ + ".discover_executables",
+            return_value=(candidate,),
+        ):
+            preflight = prepare_preflight(
+                ["pythod", "vrsion"],
+                env={},
+                windows=True,
+                cwd=folder,
+            )
+
+        self.assertEqual(preflight.suggested_argv, ("python", "--version"))
+        self.assertEqual(preflight.correction_count, 2)
+        self.assertEqual(len(preflight.semantic_corrections), 1)
+        self.assertEqual(preflight.suggested_safety.level, RiskLevel.LOW)
+
+    def test_python_option_correction_requires_approval_before_run(self) -> None:
+        output = self._output()
+        runner = mock.Mock(
+            return_value=mock.Mock(returncode=0, stdout="Python 3.x\n", stderr="")
+        )
+        choices = iter(("e", "y"))
+        with tempfile.TemporaryDirectory() as folder, mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Python/python.exe",
+        ):
+            code = run_command(
+                ["python", "vrsion"],
+                cwd=folder,
+                input_fn=lambda _prompt: next(choices),
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(runner.call_args.args[0], ["python", "--version"])
+        self.assertFalse(runner.call_args.kwargs["shell"])
+        self.assertIn("Python interpreter information option", output.getvalue())
+
+    def test_python_option_correction_can_be_cancelled(self) -> None:
+        runner = mock.Mock()
+        with tempfile.TemporaryDirectory() as folder, mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Python/python.exe",
+        ):
+            code = run_command(
+                ["python", "vrsion"],
+                cwd=folder,
+                input_fn=lambda _prompt: "",
+                interactive=True,
+                runner=runner,
+                output=self._output(),
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_CANCELLED)
+        runner.assert_not_called()
+
+    def test_color_modes_respect_streams_term_and_no_color(self) -> None:
+        class TtyOutput(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        self.assertFalse(color_is_enabled("auto", self._output(), env={}))
+        self.assertTrue(color_is_enabled("auto", TtyOutput(), env={}))
+        self.assertTrue(color_is_enabled("always", self._output(), env={}))
+        self.assertFalse(
+            color_is_enabled("always", TtyOutput(), env={"NO_COLOR": "1"})
+        )
+        self.assertFalse(
+            color_is_enabled("auto", TtyOutput(), env={"TERM": "dumb"})
+        )
+
+    def test_colored_correction_retains_plain_text_meaning(self) -> None:
+        safety = assess_command_safety(("python", "--version"))
+        colored = render_compact_correction(
+            ("python", "vrsion"),
+            ("python", "--version"),
+            correction_count=1,
+            label=MatchLabel.HIGH,
+            safety=safety,
+            indicator="[i]",
+            style=TerminalStyle(True),
+        )
+        plain = render_compact_correction(
+            ("python", "vrsion"),
+            ("python", "--version"),
+            correction_count=1,
+            label=MatchLabel.HIGH,
+            safety=safety,
+            indicator="[i]",
+        )
+
+        self.assertIn("\033[", colored)
+        self.assertNotIn("\033[", plain)
+        without_ansi = re.sub(r"\033\[[0-9;]*m", "", colored)
+        self.assertEqual(without_ansi, plain)
+
+    def test_user_supplied_terminal_controls_are_escaped(self) -> None:
+        token = "safe\033[31mred"
+        rendered = display_token(token)
+
+        self.assertNotIn("\033", rendered)
+        self.assertIn("\\u001b", rendered)
+
+    def test_shell_color_option_is_parsed_after_action(self) -> None:
+        args = make_parser().parse_args(["shell", "--color", "never"])
+
+        self.assertEqual(args.action, "shell")
+        self.assertEqual(args.color, "never")
 
     @staticmethod
     def _activation_fixture(root: Path) -> tuple[Path, Path, Path, Path]:

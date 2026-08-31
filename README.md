@@ -14,6 +14,7 @@ The repository currently contains:
 - **Step 9:** test and package TermFix reproducibly, then diagnose its local environment without changing it.
 - **Step 10:** demonstrate the real backend safely and measure it against deterministic acceptance cases.
 - **Step 11:** generate a safe, current-session PowerShell launcher for a verified portable build.
+- **Step 12:** correct strong Python interpreter-option typos and add accessible, optional terminal color.
 
 Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
 
@@ -53,6 +54,14 @@ Try a corrected run in an interactive terminal:
 python termfix.py run -- pyhton --version
 ```
 
+Correct a misspelled executable and a misspelled Python information option together:
+
+```powershell
+python termfix.py run -- pythod vrsion
+```
+
+TermFix proposes `python --version`. The executable is proven from `PATH`; `--version` is proven by a small built-in Python option profile. The corrected command still requires `y` approval and runs with `shell=False`. A real local file or a stronger local path match takes priority, and unrelated program arguments, `-m` module names and `-c` code are left unchanged.
+
 Inspect language context and check a possible code identifier without compiling or running it:
 
 ```powershell
@@ -90,6 +99,16 @@ Suggestion:
 ```
 
 The interactive terminal includes `cd PATH`, `pwd`, `clear`, `help` and `exit`. Its current directory is session-local, and a misspelled `cd` directory can receive the same evidence-backed correction and approval flow. `Ctrl+C` cancels the current input or interrupts a command without closing TermFix; `Ctrl+D`/EOF exits cleanly. Use `python termfix.py shell --cwd DIRECTORY` to choose the starting directory.
+
+Color makes changed tokens and risk labels easier to scan. It is optional and never carries meaning by itself:
+
+```powershell
+python termfix.py shell --color auto
+python termfix.py shell --color always
+python termfix.py shell --color never
+```
+
+`auto` is the default and styles only an interactive terminal. Redirected output, `TERM=dumb`, `--color never`, and the `NO_COLOR` environment variable produce plain text. The same option is available on `check`, `safety`, and `run`. The words, labels, `ⓘ`/`[i]` indicator and approval choices remain present without color.
 
 TermFix displays the suggestion and waits for one of these choices:
 
@@ -143,7 +162,7 @@ python -I -S dist/termfix.pyz doctor
 
 ## Safe demo and acceptance evaluation
 
-Show seven representative TermFix scenarios:
+Show eight representative TermFix scenarios:
 
 ```powershell
 python -I -S termfix.py demo
@@ -155,7 +174,7 @@ Run the complete Step 10 acceptance evaluation:
 python -I -S termfix.py evaluate
 ```
 
-The evaluation currently checks 18 cases covering executable, file and directory correction; false-positive refusal; stderr evidence; destructive-command and shell-operator blocking; language-aware symbol understanding; non-mutation; indicator fallback; internal interactive commands; corrupt-artifact rejection; credential redaction; and deterministic repeated analysis. It also reports observational runtime, but speed is not used as a pass condition.
+The evaluation currently checks 20 cases covering executable, file, directory and Python-option correction; false-positive refusal; stderr evidence; destructive-command and shell-operator blocking; language-aware symbol understanding; non-mutation; accessible color fallback; indicator fallback; internal interactive commands; corrupt-artifact rejection; credential redaction; and deterministic repeated analysis. It also reports observational runtime, but speed is not used as a pass condition.
 
 These commands are optional and intended for development, judging and demonstration. A normal user starts TermFix with `python termfix.py shell`. Neither `demo` nor `evaluate` launches a user command, edits project files, accesses the internet or scans the computer. They create only small isolated fixtures in the operating system's temporary directory and delete them automatically.
 
@@ -196,6 +215,9 @@ Activation requires a complete, current and unmodified `dist/termfix.pyz` plus i
 - Standard library only; `requirements.txt` is empty.
 - Suggested executables are discovered locally on `PATH`.
 - Suggested files and directories are proven to exist locally.
+- Python information-option suggestions come from a versioned built-in profile and require a strong match.
+- Existing local files and equally strong local path corrections take priority over Python option meaning.
+- Arbitrary Python program arguments, `-m` modules and `-c` code are not changed by the option profile.
 - Path searching is limited to the relevant directory; the computer is not scanned globally.
 - At most one misspelled component is corrected in each path token.
 - URLs, options and wildcard expressions are not treated as paths.
@@ -220,6 +242,7 @@ Activation requires a complete, current and unmodified `dist/termfix.pyz` plus i
 - Interactive `cd`, `pwd`, `clear`, `help` and `exit` are internal operations and do not spawn shell commands.
 - The interactive directory exists only inside the TermFix session; the parent terminal directory is not changed.
 - `ⓘ` is displayed when the terminal encoding supports it, with `[i]` as the safe fallback.
+- ANSI color is optional, TTY-aware and removable without losing any words, labels or controls; `NO_COLOR` is respected.
 - Invalid quotes, blank input, `Ctrl+C` and EOF are handled without a traceback.
 - A portable build is created only after the full test suite passes under `python -I -S` with `shell=False`.
 - The portable archive contains exactly one uncompressed `__main__.py` entry with normalized LF line endings and a fixed 1980 timestamp.
@@ -228,8 +251,8 @@ Activation requires a complete, current and unmodified `dist/termfix.pyz` plus i
 - Existing incomplete, unknown, symlinked or manually modified build output is never overwritten.
 - Build files are staged and replaced atomically; an archive replacement is rolled back if the manifest replacement fails.
 - `doctor` validates local evidence without executing subprocesses or modifying the filesystem.
-- `demo` shows seven user-facing scenarios through the real correction, safety and language backends.
-- `evaluate` runs 18 explicit acceptance cases, including false-positive and non-mutation controls.
+- `demo` shows eight user-facing scenarios through the real correction, safety and language backends.
+- `evaluate` runs 20 explicit acceptance cases, including false-positive, semantic-profile, accessibility and non-mutation controls.
 - Step 10 never launches a user command; its isolated temporary fixtures are removed automatically.
 - Acceptance output never exposes its temporary path or test credential value.
 - PowerShell activation is generated only for a portable archive whose structure, source hash, dependency proof and test evidence all validate.
@@ -258,6 +281,6 @@ Only the explicit `run` action, external commands entered inside `shell`, and th
 | `5` | Safety blocked a high-risk operation, a risk-increasing correction or invalid activation target |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-11 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-12 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.
