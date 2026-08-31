@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-10: proof-backed correction and a portable terminal assistant.
+"""TermFix Steps 2-11: proof-backed correction and a portable terminal assistant.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
@@ -11,6 +11,7 @@ source files are inspected but never executed or modified.
 The interactive prompt retains these guarantees while accepting repeated commands.
 Portable builds are deterministic, and environment diagnostics remain read-only.
 Safe demo and acceptance modes exercise the backend without launching user commands.
+PowerShell activation is explicit, session-only, and generated without shell execution.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ import zipfile
 
 
 APP_NAME = "TermFix"
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -578,6 +579,15 @@ class AcceptanceReport:
     @property
     def successful(self) -> bool:
         return self.failed == 0
+
+
+@dataclass(frozen=True)
+class ActivationTarget:
+    """Validated interpreter and portable archive used by a session launcher."""
+
+    interpreter_path: str
+    archive_path: str
+    archive_sha256: str
 
 
 def selected_environment(env: dict[str, str] | None) -> dict[str, str]:
@@ -5019,6 +5029,272 @@ def demo_command(
     return EXIT_OK if showcased and all(case.passed for case in showcased) else EXIT_NOT_FOUND
 
 
+def validated_activation_text(value: str, description: str) -> str:
+    """Reject text that could change the structure of generated shell code."""
+
+    text = str(value)
+    if not text:
+        raise ValueError(f"{description} is empty")
+    if len(text) > 32767:
+        raise ValueError(f"{description} is unexpectedly long")
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise ValueError(f"{description} contains a control character")
+    if "\u2028" in text or "\u2029" in text:
+        raise ValueError(f"{description} contains an unsupported line separator")
+    return text
+
+
+def powershell_single_quoted(value: str, description: str = "value") -> str:
+    """Return one literal PowerShell string after strict structural validation."""
+
+    text = validated_activation_text(value, description)
+    return "'" + text.replace("'", "''") + "'"
+
+
+def resolve_activation_target(
+    *,
+    source_path: Path | None = None,
+    archive_path: Path | None = None,
+    build_directory: Path | None = None,
+    interpreter_path: Path | None = None,
+) -> ActivationTarget:
+    """Resolve and validate one current portable build without executing it."""
+
+    if source_path is not None and archive_path is not None:
+        raise ValueError("activation accepts source mode or archive mode, not both")
+    if archive_path is not None and build_directory is not None:
+        raise ValueError("a custom build directory is valid only in source mode")
+    if source_path is None and archive_path is None:
+        source_path, archive_path = automatic_doctor_paths()
+
+    source = Path(source_path) if source_path is not None else None
+    if source is not None:
+        if path_is_indirection(source) or not source.is_file():
+            raise ValueError("activation source must be a regular, non-redirected file")
+        _source_text, source_bytes = normalized_python_source(source)
+        expected_source_hash = sha256_bytes(source_bytes)
+        build_root = source.parent / "dist" if build_directory is None else Path(build_directory)
+        portable = build_root / PORTABLE_ARCHIVE_NAME
+    else:
+        if archive_path is None:
+            raise ValueError("could not identify termfix.py or a running portable archive")
+        portable = Path(archive_path)
+        expected_source_hash = None
+
+    manifest_path = portable.parent / BUILD_MANIFEST_NAME
+    checks, manifest, archived_source = portable_artifact_checks(
+        portable,
+        manifest_path,
+        expected_source_hash=expected_source_hash,
+    )
+    failures = tuple(check for check in checks if check.status is DoctorStatus.FAIL)
+    warnings = tuple(check for check in checks if check.status is DoctorStatus.WARN)
+    if failures:
+        raise ValueError(f"portable build is invalid: {failures[0].detail}")
+    if warnings or manifest is None or archived_source is None:
+        detail = warnings[0].detail if warnings else "validation evidence is incomplete"
+        raise ValueError(f"portable build is unavailable: {detail}")
+    if any(check.status is not DoctorStatus.OK for check in checks):
+        raise ValueError("portable build did not pass every activation check")
+
+    archive_section = manifest.get("archive")
+    archive_hash = (
+        archive_section.get("sha256") if isinstance(archive_section, dict) else None
+    )
+    if not isinstance(archive_hash, str) or re.fullmatch(r"[0-9a-f]{64}", archive_hash) is None:
+        raise ValueError("portable build manifest has an invalid archive hash")
+
+    interpreter = Path(sys.executable) if interpreter_path is None else Path(interpreter_path)
+    try:
+        resolved_interpreter = interpreter.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"current Python interpreter cannot be resolved: {error}") from error
+    try:
+        resolved_archive = portable.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"portable archive cannot be resolved: {error}") from error
+    if not resolved_interpreter.is_file() or (
+        os.name != "nt" and not os.access(resolved_interpreter, os.X_OK)
+    ):
+        raise ValueError("current Python interpreter is not a launchable regular file")
+    if path_is_indirection(resolved_archive) or not resolved_archive.is_file():
+        raise ValueError("portable archive is not a regular, direct file")
+
+    interpreter_text = validated_activation_text(
+        str(resolved_interpreter),
+        "Python interpreter path",
+    )
+    archive_text = validated_activation_text(
+        str(resolved_archive),
+        "portable archive path",
+    )
+    return ActivationTarget(interpreter_text, archive_text, archive_hash)
+
+
+def render_powershell_activation(target: ActivationTarget) -> str:
+    """Generate a transactional, current-session PowerShell activation block."""
+
+    archive_hash = validated_activation_text(target.archive_sha256, "archive hash")
+    if re.fullmatch(r"[0-9a-f]{64}", archive_hash) is None:
+        raise ValueError("archive hash must be 64 lowercase hexadecimal characters")
+    suffix = archive_hash[:16]
+    launcher_name = f"__TermFixLauncher_{suffix}"
+    deactivator_name = f"__TermFixDeactivate_{suffix}"
+    marker_name = f"__TermFixActivation_{suffix}"
+    interpreter = powershell_single_quoted(
+        target.interpreter_path,
+        "Python interpreter path",
+    )
+    archive = powershell_single_quoted(
+        target.archive_path,
+        "portable archive path",
+    )
+    quoted_hash = powershell_single_quoted(archive_hash, "archive hash")
+    quoted_launcher = powershell_single_quoted(launcher_name, "launcher name")
+    quoted_deactivator = powershell_single_quoted(deactivator_name, "deactivator name")
+    quoted_marker = powershell_single_quoted(marker_name, "activation marker")
+    collision_names = ", ".join(
+        powershell_single_quoted(name, "command name")
+        for name in ("termfix", "termfix-deactivate", launcher_name, deactivator_name)
+    )
+    launcher_path = powershell_single_quoted(
+        f"Function:\\{launcher_name}",
+        "launcher function path",
+    )
+    deactivator_path = powershell_single_quoted(
+        f"Function:\\{deactivator_name}",
+        "deactivator function path",
+    )
+    launcher_create_path = powershell_single_quoted(
+        f"Function:global:{launcher_name}",
+        "global launcher function path",
+    )
+    deactivator_create_path = powershell_single_quoted(
+        f"Function:global:{deactivator_name}",
+        "global deactivator function path",
+    )
+
+    lines = [
+        f"# TermFix {VERSION} current-session activation; archive SHA-256 {archive_hash}",
+        "& {",
+        f"    $termfixNames = @({collision_names})",
+        "    foreach ($termfixName in $termfixNames) {",
+        "        if ($null -ne (Get-Command -Name $termfixName -ErrorAction SilentlyContinue)) {",
+        "            Write-Error ('TermFix activation refused: command already exists: ' + $termfixName)",
+        "            return",
+        "        }",
+        "    }",
+        f"    if ($null -ne (Get-Variable -Name {quoted_marker} -Scope Global -ErrorAction SilentlyContinue)) {{",
+        "        Write-Error 'TermFix activation refused: its ownership marker already exists.'",
+        "        return",
+        "    }",
+        "",
+        "    $termfixLauncherScript = {",
+        f"        if (-not (Test-Path -LiteralPath {interpreter} -PathType Leaf)) {{",
+        "            Write-Error 'TermFix launch refused: the recorded Python interpreter is unavailable.'",
+        "            return",
+        "        }",
+        "        try {",
+        f"            $termfixCurrentHash = (Get-FileHash -LiteralPath {archive} -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()",
+        "        } catch {",
+        "            Write-Error 'TermFix launch refused: the portable archive is unavailable.'",
+        "            return",
+        "        }",
+        f"        if ($termfixCurrentHash -ne {quoted_hash}) {{",
+        "            Write-Error 'TermFix launch refused: the portable build changed; rebuild and reactivate.'",
+        "            return",
+        "        }",
+        "        if ($args.Count -eq 0) {",
+        f"            & {interpreter} -I -S {archive} shell",
+        "        } else {",
+        f"            & {interpreter} -I -S {archive} @args",
+        "        }",
+        "    }",
+        "",
+        "    $termfixDeactivateScript = {",
+        f"        $termfixMarker = Get-Variable -Name {quoted_marker} -Scope Global -ErrorAction SilentlyContinue",
+        "        $termfixLauncherAlias = Get-Alias -Name termfix -ErrorAction SilentlyContinue",
+        "        $termfixDeactivateAlias = Get-Alias -Name termfix-deactivate -ErrorAction SilentlyContinue",
+        f"        $termfixLauncherFunction = Get-Item -LiteralPath {launcher_path} -ErrorAction SilentlyContinue",
+        f"        $termfixDeactivateFunction = Get-Item -LiteralPath {deactivator_path} -ErrorAction SilentlyContinue",
+        "        if (",
+        "            $null -eq $termfixMarker -or",
+        f"            [string]$termfixMarker.Value -ne {quoted_hash} -or",
+        "            $null -eq $termfixLauncherAlias -or",
+        f"            $termfixLauncherAlias.Definition -ne {quoted_launcher} -or",
+        "            $null -eq $termfixDeactivateAlias -or",
+        f"            $termfixDeactivateAlias.Definition -ne {quoted_deactivator} -or",
+        "            $null -eq $termfixLauncherFunction -or",
+        "            -not $termfixLauncherFunction.Options.ToString().Contains('ReadOnly') -or",
+        "            $null -eq $termfixDeactivateFunction -or",
+        "            -not $termfixDeactivateFunction.Options.ToString().Contains('ReadOnly')",
+        "        ) {",
+        "            Write-Error 'TermFix deactivation refused: launcher ownership could not be proven.'",
+        "            return",
+        "        }",
+        "        try {",
+        "            Remove-Item -LiteralPath 'Alias:\\termfix' -Force -ErrorAction Stop",
+        "            Remove-Item -LiteralPath 'Alias:\\termfix-deactivate' -Force -ErrorAction Stop",
+        f"            Remove-Item -LiteralPath {launcher_path} -Force -ErrorAction Stop",
+        f"            Remove-Variable -Name {quoted_marker} -Scope Global -Force -ErrorAction Stop",
+        "            Write-Host 'TermFix deactivated for this PowerShell session.'",
+        f"            Remove-Item -LiteralPath {deactivator_path} -Force -ErrorAction Stop",
+        "        } catch {",
+        "            Write-Error 'TermFix deactivation was incomplete; close this PowerShell session to clear it safely.'",
+        "        }",
+        "    }",
+        "",
+        "    try {",
+        f"        Set-Variable -Name {quoted_marker} -Value {quoted_hash} -Scope Global -Option ReadOnly -ErrorAction Stop",
+        f"        Set-Item -LiteralPath {launcher_create_path} -Value $termfixLauncherScript -Options ReadOnly -ErrorAction Stop",
+        f"        Set-Item -LiteralPath {deactivator_create_path} -Value $termfixDeactivateScript -Options ReadOnly -ErrorAction Stop",
+        f"        Set-Alias -Name termfix -Value {quoted_launcher} -Scope Global -Option ReadOnly -ErrorAction Stop",
+        f"        Set-Alias -Name termfix-deactivate -Value {quoted_deactivator} -Scope Global -Option ReadOnly -ErrorAction Stop",
+        "    } catch {",
+        "        Remove-Item -LiteralPath 'Alias:\\termfix' -Force -ErrorAction SilentlyContinue",
+        "        Remove-Item -LiteralPath 'Alias:\\termfix-deactivate' -Force -ErrorAction SilentlyContinue",
+        f"        Remove-Item -LiteralPath {launcher_path} -Force -ErrorAction SilentlyContinue",
+        f"        Remove-Item -LiteralPath {deactivator_path} -Force -ErrorAction SilentlyContinue",
+        f"        Remove-Variable -Name {quoted_marker} -Scope Global -Force -ErrorAction SilentlyContinue",
+        "        Write-Error 'TermFix activation failed; partial session state was removed.'",
+        "        return",
+        "    }",
+        "    Write-Host 'TermFix activated for this PowerShell session. Type termfix.'",
+        "}",
+    ]
+    return "\n".join(lines)
+
+
+def activate_command(
+    *,
+    shell: str,
+    source_path: Path | None = None,
+    archive_path: Path | None = None,
+    build_directory: Path | None = None,
+    interpreter_path: Path | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Print reviewed session-activation code without running or writing it."""
+
+    if str(shell).casefold() != "powershell":
+        print("Activation blocked: Step 11 supports PowerShell only.", file=error_output)
+        return EXIT_USAGE
+    try:
+        target = resolve_activation_target(
+            source_path=source_path,
+            archive_path=archive_path,
+            build_directory=build_directory,
+            interpreter_path=interpreter_path,
+        )
+        code = render_powershell_activation(target)
+    except ValueError as error:
+        print(f"Activation blocked: {error}", file=error_output)
+        return EXIT_BLOCKED
+    print(code, file=output)
+    return EXIT_OK
+
+
 def split_windows_interactive_command(line: str) -> tuple[str, ...]:
     """Split a Windows-style line while preserving ordinary path backslashes."""
 
@@ -5394,6 +5670,16 @@ def make_parser() -> argparse.ArgumentParser:
         "evaluate",
         help="run the deterministic, non-executing acceptance evaluation",
     )
+    activate = actions.add_parser(
+        "activate",
+        help="print safe current-session PowerShell activation code",
+    )
+    activate.add_argument(
+        "--shell",
+        required=True,
+        choices=("powershell",),
+        help="shell syntax to generate; Step 11 supports powershell only",
+    )
 
     actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
@@ -5440,6 +5726,8 @@ def cli(argv: list[str] | None = None) -> int:
         return demo_command()
     if args.action == "evaluate":
         return evaluation_command()
+    if args.action == "activate":
+        return activate_command(shell=args.shell)
     return EXIT_USAGE
 
 
@@ -8071,6 +8359,223 @@ class TermFixTests(unittest.TestCase):
 
         demo.assert_called_once_with()
         evaluation.assert_called_once_with()
+
+    def test_powershell_literal_escapes_apostrophes_and_rejects_structure_changes(self) -> None:
+        self.assertEqual(
+            powershell_single_quoted("C:\\Users\\O'Brien\\python.exe", "path"),
+            "'C:\\Users\\O''Brien\\python.exe'",
+        )
+        for unsafe in ("", "line\nbreak", "carriage\rreturn", "nul\x00byte", "line\u2028separator"):
+            with self.subTest(unsafe=repr(unsafe)):
+                with self.assertRaises(ValueError):
+                    powershell_single_quoted(unsafe, "path")
+
+    def test_activation_target_accepts_current_source_and_archive_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, requirements, destination, interpreter = self._activation_fixture(root)
+            source_target = resolve_activation_target(
+                source_path=source,
+                build_directory=destination,
+                interpreter_path=interpreter,
+            )
+            archive_target = resolve_activation_target(
+                archive_path=destination / PORTABLE_ARCHIVE_NAME,
+                interpreter_path=interpreter,
+            )
+
+        self.assertEqual(source_target, archive_target)
+        self.assertRegex(source_target.archive_sha256, r"^[0-9a-f]{64}$")
+        self.assertTrue(source_target.interpreter_path.endswith(interpreter.name))
+        self.assertTrue(source_target.archive_path.endswith(PORTABLE_ARCHIVE_NAME))
+
+    def test_activation_target_rejects_missing_stale_and_corrupted_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            interpreter = root / ("python.exe" if os.name == "nt" else "python")
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            interpreter.write_bytes(b"")
+            if os.name != "nt":
+                interpreter.chmod(0o755)
+
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                resolve_activation_target(
+                    source_path=source,
+                    build_directory=destination,
+                    interpreter_path=interpreter,
+                )
+
+            create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=3,
+            )
+            source.write_text("import sys\nprint(sys.version)\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "stale"):
+                resolve_activation_target(
+                    source_path=source,
+                    build_directory=destination,
+                    interpreter_path=interpreter,
+                )
+
+            source.write_text("import sys\n", encoding="utf-8")
+            (destination / PORTABLE_ARCHIVE_NAME).write_bytes(b"corrupted")
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                resolve_activation_target(
+                    source_path=source,
+                    build_directory=destination,
+                    interpreter_path=interpreter,
+                )
+
+    def test_activation_target_rejects_ambiguous_inputs_and_bad_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, _requirements, destination, interpreter = self._activation_fixture(root)
+            archive = destination / PORTABLE_ARCHIVE_NAME
+
+            with self.assertRaisesRegex(ValueError, "not both"):
+                resolve_activation_target(
+                    source_path=source,
+                    archive_path=archive,
+                    interpreter_path=interpreter,
+                )
+            with self.assertRaisesRegex(ValueError, "current Python interpreter"):
+                resolve_activation_target(
+                    source_path=source,
+                    build_directory=destination,
+                    interpreter_path=root / "missing-python.exe",
+                )
+
+    def test_powershell_activation_is_session_only_and_transactional(self) -> None:
+        target = ActivationTarget(
+            "C:\\Program Files\\O'Brien\\python.exe",
+            "C:\\TermFix Build\\termfix.pyz",
+            "a" * 64,
+        )
+        rendered = render_powershell_activation(target)
+
+        self.assertIn("O''Brien", rendered)
+        self.assertIn("@args", rendered)
+        self.assertIn(" shell", rendered)
+        self.assertIn("Get-FileHash", rendered)
+        self.assertIn("portable build changed; rebuild and reactivate", rendered)
+        self.assertIn("Get-Command", rendered)
+        self.assertIn("command already exists", rendered)
+        self.assertIn("-Option ReadOnly", rendered)
+        self.assertIn("Function:global:__TermFixLauncher_", rendered)
+        self.assertIn("Function:global:__TermFixDeactivate_", rendered)
+        self.assertIn("launcher ownership could not be proven", rendered)
+        self.assertIn("partial session state was removed", rendered)
+        self.assertIn("Alias:\\termfix-deactivate", rendered)
+        self.assertNotIn("Invoke-Expression", rendered)
+        self.assertNotRegex(rendered, r"(?i)\biex\b")
+        self.assertNotIn("$PROFILE", rendered)
+        self.assertNotIn("SetEnvironmentVariable", rendered)
+        self.assertNotIn("Start-Process", rendered)
+
+    def test_powershell_activation_rejects_invalid_hash(self) -> None:
+        with self.assertRaisesRegex(ValueError, "64 lowercase hexadecimal"):
+            render_powershell_activation(
+                ActivationTarget("C:\\python.exe", "C:\\termfix.pyz", "NOT-A-HASH")
+            )
+
+    def test_activate_command_only_reads_and_prints_reviewable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, _requirements, destination, interpreter = self._activation_fixture(root)
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            output = self._output()
+            errors = self._output()
+
+            with mock.patch(
+                __name__ + ".subprocess.run",
+                side_effect=AssertionError("activate must not launch PowerShell"),
+            ), mock.patch(
+                __name__ + ".os.replace",
+                side_effect=AssertionError("activate must not write files"),
+            ):
+                code = activate_command(
+                    shell="powershell",
+                    source_path=source,
+                    build_directory=destination,
+                    interpreter_path=interpreter,
+                    output=output,
+                    error_output=errors,
+                )
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(before, after)
+        self.assertFalse(errors.getvalue())
+        self.assertTrue(output.getvalue().startswith("# TermFix"))
+        self.assertIn("current-session activation", output.getvalue())
+
+    def test_activate_command_rejects_other_shells_and_invalid_build(self) -> None:
+        errors = self._output()
+        unsupported = activate_command(
+            shell="bash",
+            output=self._output(),
+            error_output=errors,
+        )
+        self.assertEqual(unsupported, EXIT_USAGE)
+        self.assertIn("PowerShell only", errors.getvalue())
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            source.write_text("import sys\n", encoding="utf-8")
+            blocked_output = self._output()
+            blocked_errors = self._output()
+            blocked = activate_command(
+                shell="powershell",
+                source_path=source,
+                build_directory=root / "dist",
+                output=blocked_output,
+                error_output=blocked_errors,
+            )
+
+        self.assertEqual(blocked, EXIT_BLOCKED)
+        self.assertFalse(blocked_output.getvalue())
+        self.assertIn("Activation blocked", blocked_errors.getvalue())
+
+    def test_cli_routes_activate_action(self) -> None:
+        with mock.patch(__name__ + ".activate_command", return_value=EXIT_OK) as activate:
+            code = cli(["activate", "--shell", "powershell"])
+
+        self.assertEqual(code, EXIT_OK)
+        activate.assert_called_once_with(shell="powershell")
+
+    @staticmethod
+    def _activation_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
+        source = root / "termfix.py"
+        requirements = root / "requirements.txt"
+        destination = root / "dist"
+        interpreter = root / ("python.exe" if os.name == "nt" else "python")
+        source.write_text("import sys\nprint(sys.version)\n", encoding="utf-8")
+        requirements.write_bytes(b"")
+        interpreter.write_bytes(b"")
+        if os.name != "nt":
+            interpreter.chmod(0o755)
+        create_portable_build(
+            source_path=source,
+            requirements_path=requirements,
+            output_directory=destination,
+            tests_passed=7,
+        )
+        return source, requirements, destination, interpreter
 
     @staticmethod
     def _output():

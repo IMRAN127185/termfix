@@ -13,6 +13,7 @@ The repository currently contains:
 - **Step 8:** provide a continuous `termfix>` terminal with safe built-ins and the complete correction pipeline.
 - **Step 9:** test and package TermFix reproducibly, then diagnose its local environment without changing it.
 - **Step 10:** demonstrate the real backend safely and measure it against deterministic acceptance cases.
+- **Step 11:** generate a safe, current-session PowerShell launcher for a verified portable build.
 
 Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
 
@@ -158,6 +159,38 @@ The evaluation currently checks 18 cases covering executable, file and directory
 
 These commands are optional and intended for development, judging and demonstration. A normal user starts TermFix with `python termfix.py shell`. Neither `demo` nor `evaluate` launches a user command, edits project files, accesses the internet or scans the computer. They create only small isolated fixtures in the operating system's temporary directory and delete them automatically.
 
+## Current-session PowerShell activation
+
+Step 11 lets a PowerShell user type `termfix` without permanently installing anything. First create and verify the current portable build:
+
+```powershell
+python -I -S termfix.py build
+python -I -S termfix.py doctor
+```
+
+Generate the activation block:
+
+```powershell
+python -I -S termfix.py activate --shell powershell
+```
+
+This command prints PowerShell code only. Review it, then copy the complete output and paste it into the same PowerShell window. Do not pipe it to `Invoke-Expression` or `iex`.
+
+After pasting it:
+
+```powershell
+termfix                 # opens the interactive termfix> terminal
+termfix doctor          # forwards arguments safely
+termfix demo
+termfix evaluate
+termfix --version
+termfix-deactivate      # removes this session's TermFix launcher
+```
+
+Python cannot directly change the parent PowerShell process, so activation is deliberately a review-and-paste operation. The generated block refuses command-name collisions, creates read-only session aliases, sends arguments separately with `@args`, and records the archive SHA-256 as an ownership marker. Before every launch it checks that the recorded Python interpreter still exists and recomputes the archive hash; a moved or changed build is refused until it is rebuilt and reactivated. Deactivation checks the marker, both aliases and both internal functions before removing anything.
+
+Activation requires a complete, current and unmodified `dist/termfix.pyz` plus its manifest. The generator is read-only: it does not start PowerShell, execute the generated block, write a launcher, edit `PATH` or `$PROFILE`, touch the registry, request administrator access, install packages or access the internet. Closing PowerShell also removes the session-only launcher. Step 11 intentionally supports PowerShell only; CMD and Bash require separate quoting and lifecycle designs.
+
 ## Current guarantees
 
 - Standard library only; `requirements.txt` is empty.
@@ -199,12 +232,19 @@ These commands are optional and intended for development, judging and demonstrat
 - `evaluate` runs 18 explicit acceptance cases, including false-positive and non-mutation controls.
 - Step 10 never launches a user command; its isolated temporary fixtures are removed automatically.
 - Acceptance output never exposes its temporary path or test credential value.
+- PowerShell activation is generated only for a portable archive whose structure, source hash, dependency proof and test evidence all validate.
+- Activation paths reject control characters and use escaped single-quoted PowerShell literals.
+- The activation generator prints code but never invokes PowerShell or changes the current session itself.
+- Generated `termfix` and `termfix-deactivate` aliases are session-only, collision-aware and read-only.
+- Deactivation refuses to remove anything unless its hash marker, aliases and internal functions prove ownership.
+- Running `termfix` without arguments opens `shell`; supplied arguments are forwarded with PowerShell array expansion rather than command-string construction.
+- Every activated launch rechecks the archive SHA-256, so replacement after activation cannot run silently.
 - Weak matches are rejected.
 - Tokens that do not require correction stay unchanged.
 - Candidate ranking is deterministic.
 - `check`, `safety` and `context` cannot call the executor.
 
-Only the explicit `run` action, external commands entered inside `shell`, and the isolated self-test started by `build` can launch a child process. The `check`, `safety`, `context` and `doctor` actions remain read-only. `demo` and `evaluate` do not launch commands or change project files, but they briefly create and remove isolated temporary fixtures. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all command execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added. `build` creates only the `dist` directory and its two declared files; it never installs TermFix or changes system configuration.
+Only the explicit `run` action, external commands entered inside `shell`, and the isolated self-test started by `build` can launch a child process. The `check`, `safety`, `context`, `doctor` and `activate` actions remain read-only. `demo` and `evaluate` do not launch commands or change project files, but they briefly create and remove isolated temporary fixtures. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all command execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added. `build` creates only the `dist` directory and its two declared files; it never installs TermFix or changes system configuration.
 
 ## Exit codes
 
@@ -215,9 +255,9 @@ Only the explicit `run` action, external commands entered inside `shell`, and th
 | `2` | Invalid CLI usage |
 | `3` | Reliable correction available |
 | `4` | User cancelled or interrupted the operation |
-| `5` | Safety blocked a high-risk command or risk-increasing correction |
+| `5` | Safety blocked a high-risk operation, a risk-increasing correction or invalid activation target |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-10 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-11 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.
