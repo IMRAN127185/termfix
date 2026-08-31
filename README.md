@@ -15,6 +15,7 @@ The repository currently contains:
 - **Step 10:** demonstrate the real backend safely and measure it against deterministic acceptance cases.
 - **Step 11:** generate a safe, current-session PowerShell launcher for a verified portable build.
 - **Step 12:** correct strong Python interpreter-option typos and add accessible, optional terminal color.
+- **Step 13:** collect, analyze and individually review bounded multiline command pastes without accidental execution.
 
 Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
 
@@ -98,7 +99,7 @@ Suggestion:
 [y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel
 ```
 
-The interactive terminal includes `cd PATH`, `pwd`, `clear`, `help` and `exit`. Its current directory is session-local, and a misspelled `cd` directory can receive the same evidence-backed correction and approval flow. `Ctrl+C` cancels the current input or interrupts a command without closing TermFix; `Ctrl+D`/EOF exits cleanly. Use `python termfix.py shell --cwd DIRECTORY` to choose the starting directory.
+The interactive terminal includes `cd PATH`, `pwd`, `clear`, `paste`, `help` and `exit`. Its current directory is session-local, and a misspelled `cd` directory can receive the same evidence-backed correction and approval flow. Outside paste collection, `Ctrl+C` cancels the current input or interrupts a command without closing TermFix; `Ctrl+D`/EOF exits cleanly. Use `python termfix.py shell --cwd DIRECTORY` to choose the starting directory.
 
 Color makes changed tokens and risk labels easier to scan. It is optional and never carries meaning by itself:
 
@@ -109,6 +110,30 @@ python termfix.py shell --color never
 ```
 
 `auto` is the default and styles only an interactive terminal. Redirected output, `TERM=dumb`, `--color never`, and the `NO_COLOR` environment variable produce plain text. The same option is available on `check`, `safety`, and `run`. The words, labels, `ⓘ`/`[i]` indicator and approval choices remain present without color.
+
+### Safe multiline paste mode
+
+Enter `paste` at `termfix>` before pasting several commands:
+
+```text
+termfix> paste
+paste[1]> pythod vrsion
+paste[2]> git status
+paste[3]> rm -rf /
+paste[4]> .end
+```
+
+Paste mode accepts one complete command per line. `.end` ends collection. It then parses and analyzes every line separately, displays numbered `READY`, `CORRECTED`, `BLOCKED`, `UNAVAILABLE` or `INVALID` results, and executes nothing.
+
+After analysis, TermFix generates a new unpredictable code such as:
+
+```text
+REVIEW-7A4F31C829D0B615
+```
+
+The user must manually type that exact code before per-line decisions are enabled. Text that was already buffered by the original paste is ignored while this review lock remains active, so another pasted command cannot accidentally become Run approval. Each line then offers `Run`, `Skip`, `Explain` and `Diff`; blocked, invalid and unavailable lines have no working Run action. Every selected command is analyzed again immediately before execution, and every child process still receives an argument list with `shell=False`.
+
+Collection is limited to 20 nonblank commands, 4,096 characters per line and 32,768 characters total. Exceeding a limit, sending an embedded line break through one input event, or interrupting collection closes the TermFix shell so leftover buffered input cannot fall back into the normal prompt. Interactive built-ins such as `cd` and `exit` must be entered individually outside paste mode. Step 13 handles several separate one-line commands; it deliberately does not interpret PowerShell/Bash continuations, heredocs, pipelines or multiline scripts.
 
 TermFix displays the suggestion and waits for one of these choices:
 
@@ -162,7 +187,7 @@ python -I -S dist/termfix.pyz doctor
 
 ## Safe demo and acceptance evaluation
 
-Show eight representative TermFix scenarios:
+Show nine representative TermFix scenarios:
 
 ```powershell
 python -I -S termfix.py demo
@@ -174,7 +199,7 @@ Run the complete Step 10 acceptance evaluation:
 python -I -S termfix.py evaluate
 ```
 
-The evaluation currently checks 20 cases covering executable, file, directory and Python-option correction; false-positive refusal; stderr evidence; destructive-command and shell-operator blocking; language-aware symbol understanding; non-mutation; accessible color fallback; indicator fallback; internal interactive commands; corrupt-artifact rejection; credential redaction; and deterministic repeated analysis. It also reports observational runtime, but speed is not used as a pass condition.
+The evaluation currently checks 21 cases covering executable, file, directory and Python-option correction; false-positive refusal; stderr evidence; destructive-command and shell-operator blocking; language-aware symbol understanding; non-mutation; accessible color fallback; indicator fallback; internal interactive commands; safe paste collection and review locking; corrupt-artifact rejection; credential redaction; and deterministic repeated analysis. It also reports observational runtime, but speed is not used as a pass condition.
 
 These commands are optional and intended for development, judging and demonstration. A normal user starts TermFix with `python termfix.py shell`. Neither `demo` nor `evaluate` launches a user command, edits project files, accesses the internet or scans the computer. They create only small isolated fixtures in the operating system's temporary directory and delete them automatically.
 
@@ -239,8 +264,13 @@ Activation requires a complete, current and unmodified `dist/termfix.pyz` plus i
 - Recognized undeclared-identifier failures receive a compact source-backed diagnostic; source code is never silently changed.
 - Interactive input is split into an argument vector without opening PowerShell, CMD, Bash or another system shell.
 - The interactive prompt reuses executable, path, stderr, safety and language-aware correction for every external command.
-- Interactive `cd`, `pwd`, `clear`, `help` and `exit` are internal operations and do not spawn shell commands.
+- Interactive `cd`, `pwd`, `clear`, `paste`, `help` and `exit` are internal operations and do not spawn shell commands.
 - The interactive directory exists only inside the TermFix session; the parent terminal directory is not changed.
+- Paste mode analyzes every collected line before review and never provides a Run-all shortcut.
+- A newly generated 64-bit review code prevents buffered pasted lines from becoming approvals.
+- Paste-mode commands require individual decisions and are revalidated before selected execution.
+- High-risk, invalid and unavailable paste lines cannot be run; size-limit failures close the shell safely.
+- Raw unparseable paste text is hidden so a malformed line cannot bypass credential redaction.
 - `ⓘ` is displayed when the terminal encoding supports it, with `[i]` as the safe fallback.
 - ANSI color is optional, TTY-aware and removable without losing any words, labels or controls; `NO_COLOR` is respected.
 - Invalid quotes, blank input, `Ctrl+C` and EOF are handled without a traceback.
@@ -251,8 +281,8 @@ Activation requires a complete, current and unmodified `dist/termfix.pyz` plus i
 - Existing incomplete, unknown, symlinked or manually modified build output is never overwritten.
 - Build files are staged and replaced atomically; an archive replacement is rolled back if the manifest replacement fails.
 - `doctor` validates local evidence without executing subprocesses or modifying the filesystem.
-- `demo` shows eight user-facing scenarios through the real correction, safety and language backends.
-- `evaluate` runs 20 explicit acceptance cases, including false-positive, semantic-profile, accessibility and non-mutation controls.
+- `demo` shows nine user-facing scenarios through the real correction, safety and language backends.
+- `evaluate` runs 21 explicit acceptance cases, including false-positive, semantic-profile, accessibility, paste-lock and non-mutation controls.
 - Step 10 never launches a user command; its isolated temporary fixtures are removed automatically.
 - Acceptance output never exposes its temporary path or test credential value.
 - PowerShell activation is generated only for a portable archive whose structure, source hash, dependency proof and test evidence all validate.
@@ -281,6 +311,6 @@ Only the explicit `run` action, external commands entered inside `shell`, and th
 | `5` | Safety blocked a high-risk operation, a risk-increasing correction or invalid activation target |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-12 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-13 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.

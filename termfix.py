@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-12: proof-backed correction and a portable terminal assistant.
+"""TermFix Steps 2-13: proof-backed correction and a portable terminal assistant.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
@@ -14,6 +14,7 @@ Safe demo and acceptance modes exercise the backend without launching user comma
 PowerShell activation is explicit, session-only, and generated without shell execution.
 Interpreter-option corrections use small built-in profiles and never execute discovery code.
 Optional ANSI styling improves scanning while plain text retains every meaning.
+Paste mode separates bounded collection, analysis, unlocking, and per-line decisions.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import keyword
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -43,7 +45,7 @@ import zipfile
 
 
 APP_NAME = "TermFix"
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -65,6 +67,10 @@ FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MINIMUM_PYTHON = (3, 13)
 TARGET_PYTHON = "3.14.7"
 PYTHON_OPTION_PROFILE_VERSION = 1
+MAX_PASTE_COMMANDS = 20
+MAX_PASTE_LINE_CHARS = 4096
+MAX_PASTE_TOTAL_CHARS = 32768
+PASTE_END_MARKER = ".end"
 
 
 class MatchLabel(str, Enum):
@@ -155,6 +161,23 @@ class ColorMode(str, Enum):
     AUTO = "auto"
     ALWAYS = "always"
     NEVER = "never"
+
+
+class BatchItemState(str, Enum):
+    """Review states for one collected paste-mode command."""
+
+    READY = "READY"
+    CORRECTED = "CORRECTED"
+    BLOCKED = "BLOCKED"
+    UNAVAILABLE = "UNAVAILABLE"
+    INVALID = "INVALID"
+
+
+class PasteModeResult(str, Enum):
+    """Whether the parent interactive shell may safely continue."""
+
+    CONTINUE = "continue"
+    EXIT_SHELL = "exit-shell"
 
 
 @dataclass(frozen=True)
@@ -581,6 +604,23 @@ class PreflightAnalysis:
         if not labels:
             return None
         return MatchLabel.MEDIUM if MatchLabel.MEDIUM in labels else MatchLabel.HIGH
+
+
+@dataclass(frozen=True)
+class BatchCommand:
+    """One paste-mode command and its complete pre-execution analysis."""
+
+    number: int
+    raw_line: str
+    argv: tuple[str, ...]
+    preflight: PreflightAnalysis | None
+    state: BatchItemState
+    reason: str
+    blockers: tuple[SafetyFinding, ...] = ()
+
+    @property
+    def runnable(self) -> bool:
+        return self.state in {BatchItemState.READY, BatchItemState.CORRECTED}
 
 
 @dataclass(frozen=True)
@@ -3717,6 +3757,7 @@ def run_command(
     output: object = sys.stdout,
     error_output: object = sys.stderr,
     style: TerminalStyle | None = None,
+    approved_preflight: PreflightAnalysis | None = None,
 ) -> int:
     """Preflight, optionally approve, and execute one shell-free command."""
 
@@ -3790,18 +3831,20 @@ def run_command(
                 ),
             )
         )
-        approved = request_correction_approval(
-            preflight.original_argv,
-            preflight.suggested_argv,
-            correction_count=preflight.correction_count,
-            label=preflight.match_label,
-            safety=preflight.suggested_safety,
-            explanation=explanation,
-            input_fn=input_fn,
-            interactive=interactive,
-            output=output,
-            style=active_style,
-        )
+        approved = preflight == approved_preflight
+        if not approved:
+            approved = request_correction_approval(
+                preflight.original_argv,
+                preflight.suggested_argv,
+                correction_count=preflight.correction_count,
+                label=preflight.match_label,
+                safety=preflight.suggested_safety,
+                explanation=explanation,
+                input_fn=input_fn,
+                interactive=interactive,
+                output=output,
+                style=active_style,
+            )
         if not approved:
             return EXIT_CANCELLED
 
@@ -5280,6 +5323,52 @@ def run_acceptance_evaluation() -> AcceptanceReport:
             showcase=True,
         )
 
+        paste_output = io.StringIO()
+        paste_errors = io.StringIO()
+        paste_inputs = iter(
+            (
+                "paste",
+                "pythod vrsion",
+                "rm -rf /",
+                PASTE_END_MARKER,
+                "python --version",
+                "REVIEW-EVAL",
+                "s",
+                "s",
+                "exit",
+            )
+        )
+
+        def paste_evaluation_input(_prompt: str) -> str:
+            return next(paste_inputs)
+
+        paste_code = interactive_shell(
+            cwd=root,
+            env=environment,
+            windows=os.name == "nt",
+            input_fn=paste_evaluation_input,
+            runner=forbidden_runner,
+            output=paste_output,
+            error_output=paste_errors,
+            review_code_factory=lambda: "REVIEW-EVAL",
+        )
+        paste_text = paste_output.getvalue()
+        add(
+            "Safe paste collection and review lock",
+            "Interface",
+            paste_code == EXIT_OK
+            and "python --version" in paste_text
+            and BatchItemState.CORRECTED.value in paste_text
+            and BatchItemState.BLOCKED.value in paste_text
+            and "Review remains locked" in paste_text
+            and "Paste review complete" in paste_text
+            and not paste_errors.getvalue(),
+            "paste two commands plus one buffered trailing line",
+            "analyze all, block danger, ignore buffered input, and execute nothing",
+            "reviewed safely without execution" if paste_code == EXIT_OK else f"exit {paste_code}",
+            showcase=True,
+        )
+
         corrupt_directory = root / "corrupt-build"
         corrupt_directory.mkdir()
         corrupt_archive = corrupt_directory / PORTABLE_ARCHIVE_NAME
@@ -5783,6 +5872,483 @@ def split_interactive_command(
     return tuple(lexer)
 
 
+def make_paste_review_code() -> str:
+    """Create an unpredictable code that cannot be known before paste collection ends."""
+
+    return "REVIEW-" + secrets.token_hex(8).upper()
+
+
+def analyze_pasted_commands(
+    lines: tuple[str, ...] | list[str],
+    *,
+    env: dict[str, str] | None = None,
+    windows: bool | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> tuple[BatchCommand, ...]:
+    """Analyze every collected line independently without executing anything."""
+
+    interactive_builtins = {"cd", "pwd", "help", "clear", "exit", "paste"}
+    items: list[BatchCommand] = []
+    for number, raw_line in enumerate(lines, start=1):
+        try:
+            argv = split_interactive_command(raw_line, windows=windows)
+        except ValueError as error:
+            items.append(
+                BatchCommand(
+                    number,
+                    raw_line,
+                    (),
+                    None,
+                    BatchItemState.INVALID,
+                    f"cannot parse this line: {error}",
+                )
+            )
+            continue
+        if not argv:
+            items.append(
+                BatchCommand(
+                    number,
+                    raw_line,
+                    (),
+                    None,
+                    BatchItemState.INVALID,
+                    "the line contains no command",
+                )
+            )
+            continue
+        if argv[0].casefold() in interactive_builtins:
+            items.append(
+                BatchCommand(
+                    number,
+                    raw_line,
+                    argv,
+                    None,
+                    BatchItemState.INVALID,
+                    "interactive built-ins must be entered one at a time outside paste mode",
+                )
+            )
+            continue
+
+        preflight = prepare_preflight(
+            argv,
+            env=env,
+            windows=windows,
+            cwd=cwd,
+        )
+        blockers = execution_blocking_findings(preflight.suggested_safety)
+        if preflight.risk_increased:
+            state = BatchItemState.BLOCKED
+            reason = "the proposed correction increases command risk"
+        elif blockers:
+            state = BatchItemState.BLOCKED
+            reason = "the safety engine forbids execution"
+        elif (
+            preflight.resolved_executable is None
+            and preflight.executable_correction is None
+        ):
+            state = BatchItemState.UNAVAILABLE
+            reason = "the executable could not be proven or corrected"
+        elif preflight.unresolved_paths:
+            state = BatchItemState.UNAVAILABLE
+            reason = "one or more path arguments could not be proven or corrected"
+        elif preflight.has_correction:
+            state = BatchItemState.CORRECTED
+            reason = f"{preflight.correction_count} proven correction(s) available"
+        else:
+            state = BatchItemState.READY
+            reason = "no correction is required"
+        items.append(
+            BatchCommand(
+                number,
+                raw_line,
+                argv,
+                preflight,
+                state,
+                reason,
+                blockers,
+            )
+        )
+    return tuple(items)
+
+
+def render_paste_summary(
+    items: tuple[BatchCommand, ...],
+    *,
+    style: TerminalStyle | None = None,
+) -> str:
+    """Display every collected command and its analyze-only status."""
+
+    active_style = style or TerminalStyle()
+    lines = [
+        active_style.bold(active_style.cyan("Paste analysis:")),
+        f"  {len(items)} command line(s) collected. Nothing has run.",
+        "",
+    ]
+    for item in items:
+        if item.state is BatchItemState.BLOCKED:
+            state_text = active_style.bold(active_style.red(item.state.value))
+        elif item.state in {BatchItemState.INVALID, BatchItemState.UNAVAILABLE}:
+            state_text = active_style.bold(active_style.yellow(item.state.value))
+        elif item.state is BatchItemState.CORRECTED:
+            state_text = active_style.bold(active_style.cyan(item.state.value))
+        else:
+            state_text = active_style.bold(active_style.green(item.state.value))
+        risk = (
+            f" | Risk: {styled_risk(item.preflight.suggested_safety.level, active_style)}"
+            if item.preflight is not None
+            else ""
+        )
+        lines.append(f"[{item.number}] {state_text}{risk}")
+        if item.argv:
+            lines.append(f"    Original: {display_argv(sanitized_argv(item.argv))}")
+        else:
+            lines.append(
+                f"    Input: <unparseable line hidden; {len(item.raw_line)} characters>"
+            )
+        if item.preflight is not None and item.preflight.has_correction:
+            lines.append(
+                "    Suggestion: "
+                + display_argv(sanitized_argv(item.preflight.suggested_argv))
+            )
+        lines.append(f"    Status: {item.reason}")
+        lines.append("")
+    lines.append("Review is locked; no pasted line can approve execution.")
+    return "\n".join(lines)
+
+
+def render_batch_explanation(
+    item: BatchCommand,
+    *,
+    style: TerminalStyle | None = None,
+) -> str:
+    """Render complete evidence for one paste-mode item."""
+
+    active_style = style or TerminalStyle()
+    heading = active_style.bold(active_style.cyan(f"Line {item.number} explanation:"))
+    if item.preflight is None:
+        return "\n".join((heading, f"  State: {item.state.value}", f"  Reason: {item.reason}"))
+
+    preflight = item.preflight
+    sections: list[str] = [heading]
+    if preflight.risk_increased:
+        sections.append(
+            render_blocked_correction(
+                preflight.original_safety,
+                preflight.suggested_safety,
+                style=active_style,
+            )
+        )
+    elif item.blockers:
+        sections.append(
+            render_execution_block(
+                preflight.suggested_safety,
+                item.blockers,
+                style=active_style,
+            )
+        )
+    elif preflight.has_correction:
+        sections.append(
+            render_command_corrections(
+                preflight.original_argv,
+                preflight.executable_correction,
+                preflight.path_corrections,
+                semantic_corrections=preflight.semantic_corrections,
+                style=active_style,
+            )
+        )
+        sections.append(
+            render_safety_assessment(preflight.suggested_safety, style=active_style)
+        )
+    else:
+        sections.extend(
+            (
+                f"Command: {display_argv(sanitized_argv(preflight.original_argv))}",
+                render_safety_assessment(preflight.original_safety, style=active_style),
+            )
+        )
+    if item.state is BatchItemState.UNAVAILABLE:
+        sections.append(f"Unavailable: {item.reason}. Nothing can run for this line.")
+    return "\n\n".join(sections)
+
+
+def render_batch_diff(
+    item: BatchCommand,
+    *,
+    style: TerminalStyle | None = None,
+) -> str:
+    """Render the token diff for one collected line."""
+
+    if item.preflight is None:
+        return f"Line {item.number}: diff unavailable because the command is invalid."
+    return render_token_diff(
+        item.preflight.original_argv,
+        item.preflight.suggested_argv,
+        style=style,
+    )
+
+
+def collect_pasted_lines(
+    *,
+    input_fn: object,
+    output: object,
+    error_output: object,
+    style: TerminalStyle | None = None,
+) -> tuple[PasteModeResult, tuple[str, ...]]:
+    """Collect bounded lines without parsing, approving, or executing any command."""
+
+    active_style = style or TerminalStyle()
+    print(active_style.bold(active_style.cyan("Safe paste mode — collection only")), file=output)
+    print("Paste one complete command per line.", file=output)
+    print(f"Enter {PASTE_END_MARKER} on its own line to finish collection.", file=output)
+    print(
+        f"Limits: {MAX_PASTE_COMMANDS} commands, {MAX_PASTE_LINE_CHARS} characters per line, "
+        f"{MAX_PASTE_TOTAL_CHARS} characters total.",
+        file=output,
+    )
+    print("Ctrl+C or EOF closes TermFix so buffered text cannot run.", file=output)
+
+    lines: list[str] = []
+    total_chars = 0
+    reader = input_fn
+    while True:
+        try:
+            print(
+                active_style.bold(active_style.cyan(f"paste[{len(lines) + 1}]> ")),
+                end="",
+                file=output,
+                flush=True,
+            )
+            line = reader("")
+        except (EOFError, KeyboardInterrupt):
+            print("", file=output)
+            print(
+                "Paste collection stopped; leaving TermFix so buffered input cannot run.",
+                file=output,
+            )
+            return PasteModeResult.EXIT_SHELL, ()
+        if not isinstance(line, str):
+            print("Paste input was not text; leaving TermFix safely.", file=error_output)
+            return PasteModeResult.EXIT_SHELL, ()
+        if "\r" in line or "\n" in line:
+            print(
+                "Embedded line breaks are not accepted by one paste prompt; leaving TermFix safely.",
+                file=error_output,
+            )
+            return PasteModeResult.EXIT_SHELL, ()
+        if line.strip().casefold() == PASTE_END_MARKER:
+            return PasteModeResult.CONTINUE, tuple(lines)
+
+        total_chars += len(line)
+        if len(line) > MAX_PASTE_LINE_CHARS or total_chars > MAX_PASTE_TOTAL_CHARS:
+            print(
+                "Paste size limit exceeded; leaving TermFix so remaining buffered text cannot run.",
+                file=error_output,
+            )
+            return PasteModeResult.EXIT_SHELL, ()
+        if not line.strip():
+            continue
+        if len(lines) >= MAX_PASTE_COMMANDS:
+            print(
+                "Paste command limit exceeded; leaving TermFix so remaining buffered text cannot run.",
+                file=error_output,
+            )
+            return PasteModeResult.EXIT_SHELL, ()
+        lines.append(line)
+
+
+def unlock_paste_review(
+    *,
+    input_fn: object,
+    review_code: str,
+    output: object,
+    error_output: object,
+    style: TerminalStyle | None = None,
+) -> PasteModeResult:
+    """Consume buffered input until the newly generated code is typed exactly."""
+
+    active_style = style or TerminalStyle()
+    if re.fullmatch(r"REVIEW-[A-Z0-9]{4,32}", review_code) is None:
+        print("Paste review code generation failed; leaving TermFix safely.", file=error_output)
+        return PasteModeResult.EXIT_SHELL
+    print("", file=output)
+    print("Paste collection is complete, but review is still locked.", file=output)
+    print(
+        "After all pasted text has finished, manually type this new code:",
+        file=output,
+    )
+    print(active_style.bold(active_style.green(review_code)), file=output)
+    while True:
+        try:
+            print(active_style.bold("Review code: "), end="", file=output, flush=True)
+            supplied = input_fn("")
+        except (EOFError, KeyboardInterrupt):
+            print("", file=output)
+            print("Review stayed locked; leaving TermFix. Nothing was executed.", file=output)
+            return PasteModeResult.EXIT_SHELL
+        if not isinstance(supplied, str):
+            print("Review input was not text; leaving TermFix safely.", file=error_output)
+            return PasteModeResult.EXIT_SHELL
+        if supplied.strip() == review_code:
+            print("Review unlocked. Commands still require individual Run choices.", file=output)
+            return PasteModeResult.CONTINUE
+        print("Review remains locked; buffered or incorrect input was ignored.", file=output)
+
+
+def review_pasted_commands(
+    items: tuple[BatchCommand, ...],
+    *,
+    env: dict[str, str] | None,
+    windows: bool | None,
+    cwd: Path,
+    input_fn: object,
+    runner: object | None,
+    output: object,
+    error_output: object,
+    style: TerminalStyle | None = None,
+) -> PasteModeResult:
+    """Require an explicit decision for every analyzed paste-mode command."""
+
+    active_style = style or TerminalStyle()
+    for item in items:
+        print("", file=output)
+        print(
+            active_style.bold(
+                active_style.cyan(f"Review line {item.number}/{len(items)} — {item.state.value}")
+            ),
+            file=output,
+        )
+        command_text = (
+            display_argv(sanitized_argv(item.argv))
+            if item.argv
+            else f"<unparseable line hidden; {len(item.raw_line)} characters>"
+        )
+        print(f"  {command_text}", file=output)
+        while True:
+            if item.runnable:
+                choices = "[r] Run   [s] Skip   [e] Explain   [d] Diff"
+            else:
+                choices = "[s] Skip   [e] Explain   [d] Diff   [r] Run unavailable"
+            print(choices, file=output)
+            try:
+                choice = input_fn(active_style.bold("Choice: ")).strip().casefold()
+            except EOFError:
+                print("EOF received; leaving TermFix. Remaining lines were skipped.", file=output)
+                return PasteModeResult.EXIT_SHELL
+            except KeyboardInterrupt:
+                print("", file=output)
+                print("Review interrupted; remaining lines were skipped.", file=output)
+                return PasteModeResult.CONTINUE
+            if choice in {"s", "skip", ""}:
+                print(f"Line {item.number} skipped. Nothing was executed.", file=output)
+                break
+            if choice in {"e", "explain"}:
+                print(render_batch_explanation(item, style=active_style), file=output)
+                continue
+            if choice in {"d", "diff"}:
+                print(render_batch_diff(item, style=active_style), file=output)
+                continue
+            if choice in {"r", "run"}:
+                if not item.runnable or item.preflight is None:
+                    print(
+                        f"Line {item.number} cannot run: {item.reason}.",
+                        file=output,
+                    )
+                    continue
+                print(
+                    f"Running reviewed line {item.number} with shell=False.",
+                    file=output,
+                )
+                try:
+                    run_command(
+                        list(item.argv),
+                        env=env,
+                        windows=windows,
+                        cwd=cwd,
+                        input_fn=input_fn,
+                        interactive=True,
+                        runner=runner,
+                        output=output,
+                        error_output=error_output,
+                        style=active_style,
+                        approved_preflight=item.preflight,
+                    )
+                except KeyboardInterrupt:
+                    print("", file=output)
+                    print(
+                        "Command interrupted. Paste review is continuing.",
+                        file=output,
+                    )
+                break
+            print("Choose r, s, e, or d. Enter also skips this line.", file=output)
+    print("", file=output)
+    print("Paste review complete. Returning to termfix>.", file=output)
+    return PasteModeResult.CONTINUE
+
+
+def interactive_paste_mode(
+    *,
+    env: dict[str, str] | None = None,
+    windows: bool | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    input_fn: object,
+    runner: object | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+    style: TerminalStyle | None = None,
+    review_code_factory: object | None = None,
+) -> PasteModeResult:
+    """Collect, analyze, unlock, and individually review a safe command batch."""
+
+    active_style = style or TerminalStyle()
+    working_directory = Path.cwd() if cwd is None else Path(cwd)
+    collection_result, lines = collect_pasted_lines(
+        input_fn=input_fn,
+        output=output,
+        error_output=error_output,
+        style=active_style,
+    )
+    if collection_result is PasteModeResult.EXIT_SHELL:
+        return collection_result
+    if not lines:
+        print("No commands were collected. Nothing was executed.", file=output)
+        return PasteModeResult.CONTINUE
+
+    items = analyze_pasted_commands(
+        lines,
+        env=env,
+        windows=windows,
+        cwd=working_directory,
+    )
+    print("", file=output)
+    print(render_paste_summary(items, style=active_style), file=output)
+    factory = make_paste_review_code if review_code_factory is None else review_code_factory
+    try:
+        review_code = str(factory())
+    except Exception:
+        print("Paste review code generation failed; leaving TermFix safely.", file=error_output)
+        return PasteModeResult.EXIT_SHELL
+    unlock_result = unlock_paste_review(
+        input_fn=input_fn,
+        review_code=review_code,
+        output=output,
+        error_output=error_output,
+        style=active_style,
+    )
+    if unlock_result is PasteModeResult.EXIT_SHELL:
+        return unlock_result
+    return review_pasted_commands(
+        items,
+        env=env,
+        windows=windows,
+        cwd=working_directory,
+        input_fn=input_fn,
+        runner=runner,
+        output=output,
+        error_output=error_output,
+        style=active_style,
+    )
+
+
 def render_interactive_help() -> str:
     """Return the small built-in command guide for the interactive prompt."""
 
@@ -5792,6 +6358,7 @@ def render_interactive_help() -> str:
             "  cd PATH   Change this TermFix session's current directory.",
             "  pwd       Show the current directory.",
             "  clear     Clear the terminal display.",
+            "  paste     Collect and safely review multiple one-line commands.",
             "  help      Show this guide.",
             "  exit      Return to the normal terminal.",
             "  Any other input is checked and run through TermFix.",
@@ -5894,6 +6461,7 @@ def interactive_shell(
     output: object = sys.stdout,
     error_output: object = sys.stderr,
     color_mode: str | ColorMode = ColorMode.AUTO,
+    review_code_factory: object | None = None,
 ) -> int:
     """Run a continuous safe prompt while keeping all session state in memory."""
 
@@ -5911,6 +6479,7 @@ def interactive_shell(
 
     print(style.bold(style.cyan(f"TermFix interactive terminal {VERSION}")), file=output)
     print("Type help for commands or exit to return to the normal terminal.", file=output)
+    print("Type paste before entering or pasting multiple command lines.", file=output)
     print("Commands are parsed as arguments; no system shell is opened.", file=output)
 
     while True:
@@ -5963,6 +6532,25 @@ def interactive_shell(
                 print("Usage: clear", file=error_output)
             else:
                 clear_interactive_screen(output)
+            continue
+        if builtin == "paste":
+            if len(command) != 1:
+                print("Usage: paste", file=error_output)
+                continue
+            paste_result = interactive_paste_mode(
+                env=env,
+                windows=windows,
+                cwd=current_directory,
+                input_fn=reader,
+                runner=runner,
+                output=output,
+                error_output=error_output,
+                style=style,
+                review_code_factory=review_code_factory,
+            )
+            if paste_result is PasteModeResult.EXIT_SHELL:
+                print("Leaving TermFix.", file=output)
+                return EXIT_OK
             continue
         if builtin == "cd":
             current_directory = change_interactive_directory(
@@ -8154,6 +8742,255 @@ class TermFixTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_USAGE)
 
+    def test_paste_analysis_classifies_each_line_without_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            tools = root / "bin"
+            tools.mkdir()
+            create_evaluation_executable(tools, "python")
+            create_evaluation_executable(tools, "rm")
+            environment = {"PATH": str(tools)}
+            if os.name == "nt":
+                environment["PATHEXT"] = ".EXE;.CMD;.BAT;.COM"
+            with mock.patch(
+                __name__ + ".execute_command",
+                side_effect=AssertionError("analysis must not execute"),
+            ):
+                items = analyze_pasted_commands(
+                    (
+                        "pythod vrsion",
+                        "rm -rf /",
+                        "python missing.py",
+                        'python "unterminated',
+                        "cd source",
+                    ),
+                    env=environment,
+                    windows=os.name == "nt",
+                    cwd=root,
+                )
+
+        self.assertEqual(
+            tuple(item.state for item in items),
+            (
+                BatchItemState.CORRECTED,
+                BatchItemState.BLOCKED,
+                BatchItemState.UNAVAILABLE,
+                BatchItemState.INVALID,
+                BatchItemState.INVALID,
+            ),
+        )
+        self.assertEqual(items[0].preflight.suggested_argv, ("python", "--version"))
+        self.assertFalse(items[1].runnable)
+
+    def test_paste_review_lock_consumes_buffered_commands(self) -> None:
+        output = self._output()
+        runner = mock.Mock()
+        supplied = iter(
+            (
+                "python --version",
+                PASTE_END_MARKER,
+                "r",
+                "python -c print('must-not-run')",
+                "REVIEW-TEST",
+                "s",
+            )
+        )
+        with tempfile.TemporaryDirectory() as folder, mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Python/python.exe",
+        ):
+            result = interactive_paste_mode(
+                cwd=folder,
+                input_fn=lambda _prompt: next(supplied),
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+                review_code_factory=lambda: "REVIEW-TEST",
+            )
+
+        self.assertEqual(result, PasteModeResult.CONTINUE)
+        runner.assert_not_called()
+        self.assertEqual(
+            output.getvalue().count("Review remains locked"),
+            2,
+        )
+        self.assertIn("Line 1 skipped", output.getvalue())
+
+    def test_paste_review_runs_only_selected_line_with_shell_false(self) -> None:
+        output = self._output()
+        errors = self._output()
+        runner = mock.Mock(
+            return_value=mock.Mock(returncode=0, stdout="Python 3.x\n", stderr="")
+        )
+        choices = iter(
+            (
+                "pythod vrsion",
+                "rm -rf /",
+                "python --version",
+                PASTE_END_MARKER,
+                "REVIEW-TEST",
+                "e",
+                "d",
+                "r",
+                "r",
+                "s",
+                "s",
+            )
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            tools = root / "bin"
+            tools.mkdir()
+            create_evaluation_executable(tools, "python")
+            create_evaluation_executable(tools, "rm")
+            environment = {"PATH": str(tools)}
+            if os.name == "nt":
+                environment["PATHEXT"] = ".EXE;.CMD;.BAT;.COM"
+            result = interactive_paste_mode(
+                env=environment,
+                windows=os.name == "nt",
+                cwd=root,
+                input_fn=lambda _prompt: next(choices),
+                runner=runner,
+                output=output,
+                error_output=errors,
+                review_code_factory=lambda: "REVIEW-TEST",
+            )
+
+        self.assertEqual(result, PasteModeResult.CONTINUE)
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args.args[0], ["python", "--version"])
+        self.assertFalse(runner.call_args.kwargs["shell"])
+        self.assertIn("Token diff", output.getvalue())
+        self.assertIn("cannot run", output.getvalue())
+
+    def test_paste_size_and_command_limits_exit_shell_safely(self) -> None:
+        oversized = iter(("x" * (MAX_PASTE_LINE_CHARS + 1),))
+        size_result, size_lines = collect_pasted_lines(
+            input_fn=lambda _prompt: next(oversized),
+            output=self._output(),
+            error_output=self._output(),
+        )
+        commands = iter((*(("python --version",) * (MAX_PASTE_COMMANDS + 1)),))
+        count_result, count_lines = collect_pasted_lines(
+            input_fn=lambda _prompt: next(commands),
+            output=self._output(),
+            error_output=self._output(),
+        )
+
+        self.assertEqual(size_result, PasteModeResult.EXIT_SHELL)
+        self.assertEqual(count_result, PasteModeResult.EXIT_SHELL)
+        self.assertEqual(size_lines, ())
+        self.assertEqual(count_lines, ())
+
+    def test_paste_embedded_line_break_is_rejected(self) -> None:
+        result, lines = collect_pasted_lines(
+            input_fn=lambda _prompt: "python --version\nrm -rf /",
+            output=self._output(),
+            error_output=self._output(),
+        )
+
+        self.assertEqual(result, PasteModeResult.EXIT_SHELL)
+        self.assertEqual(lines, ())
+
+    def test_unparseable_paste_line_does_not_expose_credential_text(self) -> None:
+        secret = "paste-mode-secret"
+        items = analyze_pasted_commands((f'tool --token {secret} "',), windows=True)
+        rendered = "\n".join(
+            (
+                render_paste_summary(items),
+                render_batch_explanation(items[0]),
+                render_batch_diff(items[0]),
+            )
+        )
+
+        self.assertEqual(items[0].state, BatchItemState.INVALID)
+        self.assertNotIn(secret, rendered)
+        self.assertIn("unparseable line hidden", rendered)
+
+    def test_paste_preapproval_is_revalidated_before_execution(self) -> None:
+        runner = mock.Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ):
+                reviewed = prepare_preflight(["python", "vrsion"], cwd=root)
+                (root / "version").write_text("print('local')\n", encoding="utf-8")
+                code = run_command(
+                    ["python", "vrsion"],
+                    cwd=root,
+                    input_fn=lambda _prompt: "",
+                    interactive=True,
+                    runner=runner,
+                    output=self._output(),
+                    error_output=self._output(),
+                    approved_preflight=reviewed,
+                )
+
+        self.assertEqual(code, EXIT_CANCELLED)
+        runner.assert_not_called()
+
+    def test_interactive_paste_mode_returns_to_prompt_after_review(self) -> None:
+        output = self._output()
+        runner = mock.Mock(
+            return_value=mock.Mock(returncode=0, stdout="Python 3.x\n", stderr="")
+        )
+        inputs = iter(
+            (
+                "paste",
+                "python --version",
+                PASTE_END_MARKER,
+                "REVIEW-TEST",
+                "r",
+                "exit",
+            )
+        )
+        with tempfile.TemporaryDirectory() as folder, mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Python/python.exe",
+        ):
+            code = interactive_shell(
+                cwd=folder,
+                input_fn=lambda _prompt: next(inputs),
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+                review_code_factory=lambda: "REVIEW-TEST",
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(runner.call_count, 1)
+        self.assertIn("Paste review complete", output.getvalue())
+        self.assertIn("Leaving TermFix", output.getvalue())
+
+    def test_paste_eof_at_review_lock_exits_without_execution(self) -> None:
+        runner = mock.Mock()
+        inputs = iter(("python --version", PASTE_END_MARKER))
+
+        def reader(_prompt: str) -> str:
+            try:
+                return next(inputs)
+            except StopIteration as error:
+                raise EOFError from error
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Python/python.exe",
+        ):
+            result = interactive_paste_mode(
+                cwd=folder,
+                input_fn=reader,
+                runner=runner,
+                output=self._output(),
+                error_output=self._output(),
+                review_code_factory=lambda: "REVIEW-TEST",
+            )
+
+        self.assertEqual(result, PasteModeResult.EXIT_SHELL)
+        runner.assert_not_called()
+
     def test_cli_routes_shell_action(self) -> None:
         with mock.patch(__name__ + ".interactive_shell", return_value=EXIT_OK) as shell:
             code = cli(["shell", "--cwd", "."])
@@ -8670,7 +9507,7 @@ class TermFixTests(unittest.TestCase):
             report = run_acceptance_evaluation()
 
         self.assertTrue(report.successful)
-        self.assertEqual(report.passed, 20)
+        self.assertEqual(report.passed, 21)
         self.assertEqual(report.failed, 0)
         self.assertGreaterEqual(report.elapsed_ms, 0)
         self.assertEqual(
@@ -8705,8 +9542,8 @@ class TermFixTests(unittest.TestCase):
         for rendered in (rendered_evaluation, rendered_demo):
             self.assertNotIn("termfix-evaluation-", rendered)
             self.assertNotIn("evaluation-secret-value", rendered)
-        self.assertIn("20/20 acceptance cases passed", rendered_evaluation)
-        self.assertIn("8/8 scenarios passed", rendered_demo)
+        self.assertIn("21/21 acceptance cases passed", rendered_evaluation)
+        self.assertIn("9/9 scenarios passed", rendered_demo)
         self.assertIn("[i]", rendered_demo)
 
     def test_evaluation_command_reports_success_and_non_execution_guarantee(self) -> None:
@@ -8725,7 +9562,7 @@ class TermFixTests(unittest.TestCase):
         self.assertEqual(code, EXIT_OK)
         rendered = output.getvalue()
         self.assertIn("TermFix Safe Demo", rendered)
-        self.assertEqual(rendered.count("Scenario "), 8)
+        self.assertEqual(rendered.count("Scenario "), 9)
         self.assertIn("pyhton mian.py", rendered)
         self.assertIn("rm -rf /", rendered)
         self.assertIn("calcluate -> calculate", rendered)
