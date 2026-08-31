@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-7: proof-backed terminal correction and context detection.
+"""TermFix Steps 2-8: proof-backed correction and an interactive terminal.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
@@ -8,6 +8,7 @@ The check and safety actions never execute commands. The run action uses an
 argument vector with shell=False and requires explicit approval for corrections.
 Language context and code symbols are inferred from bounded, local evidence only;
 source files are inspected but never executed or modified.
+The interactive prompt retains these guarantees while accepting repeated commands.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import keyword
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,7 +34,7 @@ from unittest import mock
 
 
 APP_NAME = "TermFix"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -1214,6 +1216,8 @@ def identifiers_from_code_error(error_text: str | None) -> tuple[str, ...]:
 def render_code_error_diagnostic(
     understanding: LanguageUnderstanding,
     identifiers: tuple[str, ...],
+    *,
+    indicator: str = "[i]",
 ) -> str | None:
     """Render only useful, evidence-backed identifier findings after a failure."""
 
@@ -1227,7 +1231,7 @@ def render_code_error_diagnostic(
         if correction is not None:
             findings.extend(
                 (
-                    f"  {identifier} -> {correction.suggested}  [i]",
+                    f"  {identifier} -> {correction.suggested}  {indicator}",
                     f"  Kind: {correction.kind.value} | Match: "
                     f"{correction.score}/100 ({correction.label.value})",
                     f"  Evidence: {correction.evidence}",
@@ -2845,6 +2849,7 @@ def render_compact_correction(
     correction_count: int,
     label: MatchLabel,
     safety: SafetyAssessment,
+    indicator: str = "[i]",
 ) -> str:
     """Render the small approval view used before corrected execution."""
 
@@ -2855,12 +2860,23 @@ def render_compact_correction(
             f"  {display_argv(sanitized_argv(original))}",
             "",
             "Suggestion:",
-            f"  {display_argv(sanitized_argv(suggested))}  [i]",
+            f"  {display_argv(sanitized_argv(suggested))}  {indicator}",
             "",
             f"{correction_count} {noun} | Match: {label.value} | "
             f"Risk: {safety.level.value}",
         )
     )
+
+
+def information_indicator(output: object = sys.stdout) -> str:
+    """Use the circled information mark only when the output encoding supports it."""
+
+    encoding = getattr(output, "encoding", None) or "utf-8"
+    try:
+        "ⓘ".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return "[i]"
+    return "ⓘ"
 
 
 def render_token_diff(
@@ -2930,6 +2946,7 @@ def request_correction_approval(
             correction_count=correction_count,
             label=label,
             safety=safety,
+            indicator=information_indicator(output),
         ),
         file=output,
     )
@@ -3389,6 +3406,7 @@ def run_command(
         code_diagnostic = render_code_error_diagnostic(
             failure_understanding,
             code_error_identifiers,
+            indicator=information_indicator(output),
         )
         if code_diagnostic is not None:
             print(code_diagnostic, file=output)
@@ -3638,6 +3656,296 @@ def context_command(
     return EXIT_OK
 
 
+def split_windows_interactive_command(line: str) -> tuple[str, ...]:
+    """Split a Windows-style line while preserving ordinary path backslashes."""
+
+    tokens: list[str] = []
+    token: list[str] = []
+    active_quote: str | None = None
+    token_started = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if character.isspace() and active_quote is None:
+            if token_started:
+                tokens.append("".join(token))
+                token = []
+                token_started = False
+            index += 1
+            continue
+
+        if character == "'":
+            token_started = True
+            if active_quote is None:
+                active_quote = "'"
+            elif active_quote == "'":
+                active_quote = None
+            else:
+                token.append(character)
+            index += 1
+            continue
+
+        if character == "\\":
+            start = index
+            while index < len(line) and line[index] == "\\":
+                index += 1
+            count = index - start
+            if index < len(line) and line[index] == '"' and active_quote != "'":
+                token.extend("\\" * (count // 2))
+                token_started = True
+                if count % 2:
+                    token.append('"')
+                elif active_quote == '"':
+                    active_quote = None
+                else:
+                    active_quote = '"'
+                index += 1
+            else:
+                token.extend("\\" * count)
+                token_started = True
+            continue
+
+        if character == '"':
+            token_started = True
+            if active_quote is None:
+                active_quote = '"'
+            elif active_quote == '"':
+                active_quote = None
+            else:
+                token.append(character)
+            index += 1
+            continue
+
+        token.append(character)
+        token_started = True
+        index += 1
+
+    if active_quote is not None:
+        raise ValueError(f"No closing quotation for {active_quote}")
+    if token_started:
+        tokens.append("".join(token))
+    return tuple(tokens)
+
+
+def split_interactive_command(
+    line: str,
+    *,
+    windows: bool | None = None,
+) -> tuple[str, ...]:
+    """Split one prompt line into arguments without invoking any system shell."""
+
+    is_windows = os.name == "nt" if windows is None else windows
+    if is_windows:
+        return split_windows_interactive_command(line)
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return tuple(lexer)
+
+
+def render_interactive_help() -> str:
+    """Return the small built-in command guide for the interactive prompt."""
+
+    return "\n".join(
+        (
+            "TermFix interactive commands:",
+            "  cd PATH   Change this TermFix session's current directory.",
+            "  pwd       Show the current directory.",
+            "  clear     Clear the terminal display.",
+            "  help      Show this guide.",
+            "  exit      Return to the normal terminal.",
+            "  Any other input is checked and run through TermFix.",
+            "Corrected commands require y; high-risk commands remain blocked.",
+        )
+    )
+
+
+def clear_interactive_screen(output: object = sys.stdout) -> None:
+    """Clear with a terminal control sequence instead of spawning a shell command."""
+
+    print("\033[2J\033[H", end="", file=output, flush=True)
+
+
+def change_interactive_directory(
+    argv: tuple[str, ...],
+    current_directory: Path,
+    *,
+    input_fn: object,
+    output: object,
+    error_output: object,
+) -> Path:
+    """Validate and optionally correct a cd target without changing process cwd."""
+
+    if len(argv) != 2:
+        print("Usage: cd PATH", file=error_output)
+        return current_directory
+
+    original_target = argv[1]
+    target = local_path(original_target, current_directory)
+    if safe_is_directory(target):
+        try:
+            return target.resolve(strict=True)
+        except (OSError, ValueError):
+            print(f"cd: cannot resolve directory: {original_target}", file=error_output)
+            return current_directory
+
+    correction = find_path_correction(
+        original_target,
+        1,
+        cwd=current_directory,
+        assume_path=True,
+    )
+    if correction is None:
+        print(f"cd: directory not found: {original_target}", file=error_output)
+        return current_directory
+
+    corrected_target = local_path(correction.suggested_token, current_directory)
+    if not safe_is_directory(corrected_target):
+        print(f"cd: directory not found: {original_target}", file=error_output)
+        return current_directory
+
+    approved = request_correction_approval(
+        ("cd", original_target),
+        ("cd", correction.suggested_token),
+        correction_count=1,
+        label=correction.label,
+        safety=SafetyAssessment(
+            RiskLevel.LOW,
+            (
+                SafetyFinding(
+                    RiskLevel.LOW,
+                    "interactive-cd",
+                    "the built-in changes only the current TermFix session directory",
+                    f"local directory: {Path(correction.resolved_path).name}",
+                ),
+            ),
+        ),
+        explanation=render_command_corrections(
+            ("cd", original_target),
+            None,
+            (correction,),
+        ),
+        input_fn=input_fn,
+        interactive=True,
+        output=output,
+    )
+    if not approved:
+        return current_directory
+    try:
+        return corrected_target.resolve(strict=True)
+    except (OSError, ValueError):
+        print(
+            f"cd: corrected directory became unavailable: {correction.suggested_token}",
+            file=error_output,
+        )
+        return current_directory
+
+
+def interactive_shell(
+    *,
+    env: dict[str, str] | None = None,
+    windows: bool | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    input_fn: object | None = None,
+    runner: object | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Run a continuous safe prompt while keeping all session state in memory."""
+
+    reader = input if input_fn is None else input_fn
+    initial_directory = Path.cwd() if cwd is None else Path(cwd)
+    try:
+        current_directory = initial_directory.resolve(strict=True)
+    except (OSError, ValueError):
+        print(f"termfix: starting directory is unavailable: {initial_directory}", file=error_output)
+        return EXIT_USAGE
+    if not safe_is_directory(current_directory):
+        print(f"termfix: starting path is not a directory: {initial_directory}", file=error_output)
+        return EXIT_USAGE
+
+    print(f"TermFix interactive terminal {VERSION}", file=output)
+    print("Type help for commands or exit to return to the normal terminal.", file=output)
+    print("Commands are parsed as arguments; no system shell is opened.", file=output)
+
+    while True:
+        try:
+            print("termfix> ", end="", file=output, flush=True)
+            line = reader("")
+        except EOFError:
+            print("", file=output)
+            print("Leaving TermFix.", file=output)
+            return EXIT_OK
+        except KeyboardInterrupt:
+            print("", file=output)
+            print("Input cancelled. Type exit to leave TermFix.", file=output)
+            continue
+
+        if not isinstance(line, str):
+            print("Input error: the prompt reader did not return text.", file=error_output)
+            continue
+        if not line.strip():
+            continue
+        try:
+            command = split_interactive_command(line, windows=windows)
+        except ValueError as error:
+            print(f"Input error: {error}", file=error_output)
+            continue
+        if not command:
+            continue
+
+        builtin = command[0].casefold()
+        if builtin == "exit":
+            if len(command) != 1:
+                print("Usage: exit", file=error_output)
+                continue
+            print("Leaving TermFix.", file=output)
+            return EXIT_OK
+        if builtin == "help":
+            if len(command) != 1:
+                print("Usage: help", file=error_output)
+            else:
+                print(render_interactive_help(), file=output)
+            continue
+        if builtin == "pwd":
+            if len(command) != 1:
+                print("Usage: pwd", file=error_output)
+            else:
+                print(str(current_directory), file=output)
+            continue
+        if builtin == "clear":
+            if len(command) != 1:
+                print("Usage: clear", file=error_output)
+            else:
+                clear_interactive_screen(output)
+            continue
+        if builtin == "cd":
+            current_directory = change_interactive_directory(
+                command,
+                current_directory,
+                input_fn=reader,
+                output=output,
+                error_output=error_output,
+            )
+            continue
+
+        try:
+            run_command(
+                list(command),
+                env=env,
+                windows=windows,
+                cwd=current_directory,
+                input_fn=reader,
+                interactive=True,
+                runner=runner,
+                output=output,
+                error_output=error_output,
+            )
+        except KeyboardInterrupt:
+            print("", file=output)
+            print("Command interrupted. TermFix is still open.", file=output)
+
+
 def make_parser() -> argparse.ArgumentParser:
     """Create the TermFix command-line parser."""
 
@@ -3697,6 +4005,16 @@ def make_parser() -> argparse.ArgumentParser:
     )
     context.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
+    shell = actions.add_parser(
+        "shell",
+        help="open the continuous interactive TermFix terminal",
+    )
+    shell.add_argument(
+        "--cwd",
+        metavar="DIRECTORY",
+        help="start in this directory instead of the current directory",
+    )
+
     actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
 
@@ -3732,6 +4050,8 @@ def cli(argv: list[str] | None = None) -> int:
             explicit_shell=args.shell,
             error_text=args.error_text,
         )
+    if args.action == "shell":
+        return interactive_shell(cwd=args.cwd)
     return EXIT_USAGE
 
 
@@ -5383,6 +5703,357 @@ class TermFixTests(unittest.TestCase):
         self.assertIn("Code diagnostic:", output.getvalue())
         self.assertIn("calcluate -> calculate", output.getvalue())
         self.assertIn("Source was not modified", output.getvalue())
+
+    def test_interactive_parser_handles_posix_quotes_and_comments_as_arguments(self) -> None:
+        parsed = split_interactive_command(
+            'python "my file.py" --label "hello world" #literal',
+            windows=False,
+        )
+
+        self.assertEqual(
+            parsed,
+            ("python", "my file.py", "--label", "hello world", "#literal"),
+        )
+
+    def test_interactive_parser_preserves_windows_backslashes_and_quoted_paths(self) -> None:
+        parsed = split_interactive_command(
+            'python "C:\\Program Files\\main.py" C:\\Users\\M\\app.py '
+            '--label="hello world" ""',
+            windows=True,
+        )
+
+        self.assertEqual(
+            parsed,
+            (
+                "python",
+                "C:\\Program Files\\main.py",
+                "C:\\Users\\M\\app.py",
+                "--label=hello world",
+                "",
+            ),
+        )
+
+    def test_interactive_parser_rejects_unclosed_quote(self) -> None:
+        with self.assertRaises(ValueError):
+            split_interactive_command('python "main.py', windows=False)
+        with self.assertRaises(ValueError):
+            split_interactive_command('python "main.py', windows=True)
+
+    def test_information_indicator_uses_unicode_or_ascii_fallback(self) -> None:
+        class EncodingOnly:
+            def __init__(self, encoding: str) -> None:
+                self.encoding = encoding
+
+        self.assertEqual(information_indicator(EncodingOnly("utf-8")), "ⓘ")
+        self.assertEqual(information_indicator(EncodingOnly("ascii")), "[i]")
+
+    def test_compact_renderer_accepts_unicode_indicator(self) -> None:
+        rendered = render_compact_correction(
+            ["pyhton", "main.py"],
+            ["python", "main.py"],
+            correction_count=1,
+            label=MatchLabel.HIGH,
+            safety=assess_command_safety(["python", "main.py"]),
+            indicator="ⓘ",
+        )
+
+        self.assertIn("python main.py  ⓘ", rendered)
+
+    def test_interactive_help_pwd_clear_and_exit_are_internal(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            output = self._output()
+            error_output = self._output()
+            reader = mock.Mock(side_effect=("pwd", "help", "clear", "exit"))
+            runner = mock.Mock()
+            with mock.patch(__name__ + ".subprocess.run") as subprocess_runner:
+                code = interactive_shell(
+                    cwd=folder,
+                    input_fn=reader,
+                    runner=runner,
+                    output=output,
+                    error_output=error_output,
+                )
+
+        rendered = output.getvalue()
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn(str(Path(folder).resolve()), rendered)
+        self.assertIn("TermFix interactive commands:", rendered)
+        self.assertIn("\033[2J\033[H", rendered)
+        self.assertIn("Leaving TermFix.", rendered)
+        runner.assert_not_called()
+        subprocess_runner.assert_not_called()
+
+    def test_interactive_cd_changes_only_session_directory(self) -> None:
+        process_directory = Path.cwd()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            child = root / "child"
+            child.mkdir()
+            output = self._output()
+            code = interactive_shell(
+                cwd=root,
+                input_fn=mock.Mock(side_effect=("cd child", "pwd", "exit")),
+                runner=mock.Mock(),
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn(str(child.resolve()), output.getvalue())
+        self.assertEqual(Path.cwd(), process_directory)
+
+    def test_interactive_cd_can_approve_proven_directory_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            expected = root / "source"
+            expected.mkdir()
+            output = self._output()
+            code = interactive_shell(
+                cwd=root,
+                input_fn=mock.Mock(
+                    side_effect=("cd soruce", "y", "pwd", "exit"),
+                ),
+                runner=mock.Mock(),
+                output=output,
+                error_output=self._output(),
+            )
+
+        rendered = output.getvalue()
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("cd soruce", rendered)
+        self.assertIn("cd source", rendered)
+        self.assertIn(str(expected.resolve()), rendered)
+
+    def test_interactive_cd_correction_can_be_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "source").mkdir()
+            output = self._output()
+            code = interactive_shell(
+                cwd=root,
+                input_fn=mock.Mock(
+                    side_effect=("cd soruce", "n", "pwd", "exit"),
+                ),
+                runner=mock.Mock(),
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn(str(root.resolve()), output.getvalue())
+        self.assertIn("Cancelled", output.getvalue())
+
+    def test_interactive_cd_rejects_file_and_missing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "note.txt").write_text("data", encoding="utf-8")
+            errors = self._output()
+            code = interactive_shell(
+                cwd=root,
+                input_fn=mock.Mock(
+                    side_effect=("cd note.txt", "cd missing", "cd", "exit"),
+                ),
+                runner=mock.Mock(),
+                output=self._output(),
+                error_output=errors,
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("directory not found: note.txt", errors.getvalue())
+        self.assertIn("directory not found: missing", errors.getvalue())
+        self.assertIn("Usage: cd PATH", errors.getvalue())
+
+    def test_interactive_external_command_uses_run_pipeline_and_session_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            runner = mock.Mock(
+                return_value=subprocess.CompletedProcess(
+                    ["python", "--version"],
+                    0,
+                    stdout="Python test\n",
+                    stderr="",
+                )
+            )
+            output = self._output()
+            with mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Python/python.exe",
+            ):
+                code = interactive_shell(
+                    cwd=folder,
+                    input_fn=mock.Mock(side_effect=("python --version", "exit")),
+                    runner=runner,
+                    output=output,
+                    error_output=self._output(),
+                )
+
+        self.assertEqual(code, EXIT_OK)
+        runner.assert_called_once()
+        self.assertEqual(runner.call_args.args[0], ["python", "--version"])
+        self.assertFalse(runner.call_args.kwargs["shell"])
+        self.assertEqual(runner.call_args.kwargs["cwd"], str(Path(folder).resolve()))
+        self.assertIn("Python test", output.getvalue())
+
+    def test_interactive_corrected_command_requires_approval(self) -> None:
+        candidate = ExecutableCandidate(
+            "python",
+            "python.exe",
+            "C:/Python/python.exe",
+        )
+        runner = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                ["python", "--version"],
+                0,
+                stdout="Python test\n",
+                stderr="",
+            )
+        )
+        output = self._output()
+        with mock.patch(__name__ + ".command_exists", return_value=None), mock.patch(
+            __name__ + ".discover_executables",
+            return_value=(candidate,),
+        ):
+            code = interactive_shell(
+                input_fn=mock.Mock(
+                    side_effect=("pyhton --version", "y", "exit"),
+                ),
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(runner.call_args.args[0], ["python", "--version"])
+        self.assertIn("Suggestion:", output.getvalue())
+        self.assertIn("python --version", output.getvalue())
+
+    def test_interactive_high_risk_command_is_blocked_and_prompt_continues(self) -> None:
+        runner = mock.Mock()
+        output = self._output()
+        with mock.patch(__name__ + ".command_exists", return_value="C:/Tools/rm.exe"):
+            code = interactive_shell(
+                input_fn=mock.Mock(side_effect=("rm -rf /", "exit")),
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        runner.assert_not_called()
+        self.assertIn("Execution blocked:", output.getvalue())
+        self.assertGreaterEqual(output.getvalue().count("termfix> "), 2)
+
+    def test_interactive_shell_operator_is_blocked_without_system_shell(self) -> None:
+        runner = mock.Mock()
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Python/python.exe",
+        ):
+            code = interactive_shell(
+                input_fn=mock.Mock(
+                    side_effect=("python --version | more", "exit"),
+                ),
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        runner.assert_not_called()
+        self.assertIn("compound-shell-syntax", output.getvalue())
+
+    def test_interactive_blank_input_and_bad_builtin_usage_recover(self) -> None:
+        errors = self._output()
+        code = interactive_shell(
+            input_fn=mock.Mock(
+                side_effect=("", "   ", "pwd extra", "help extra", "clear extra", "exit extra", "exit"),
+            ),
+            runner=mock.Mock(),
+            output=self._output(),
+            error_output=errors,
+        )
+
+        self.assertEqual(code, EXIT_OK)
+        rendered = errors.getvalue()
+        self.assertIn("Usage: pwd", rendered)
+        self.assertIn("Usage: help", rendered)
+        self.assertIn("Usage: clear", rendered)
+        self.assertIn("Usage: exit", rendered)
+
+    def test_interactive_invalid_quote_reports_error_and_recovers(self) -> None:
+        errors = self._output()
+        code = interactive_shell(
+            windows=False,
+            input_fn=mock.Mock(side_effect=('python "main.py', "exit")),
+            runner=mock.Mock(),
+            output=self._output(),
+            error_output=errors,
+        )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("Input error:", errors.getvalue())
+
+    def test_interactive_ctrl_c_cancels_input_without_closing(self) -> None:
+        output = self._output()
+        code = interactive_shell(
+            input_fn=mock.Mock(side_effect=(KeyboardInterrupt(), "exit")),
+            runner=mock.Mock(),
+            output=output,
+            error_output=self._output(),
+        )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("Input cancelled", output.getvalue())
+        self.assertIn("Leaving TermFix", output.getvalue())
+
+    def test_interactive_ctrl_d_exits_cleanly(self) -> None:
+        output = self._output()
+        code = interactive_shell(
+            input_fn=mock.Mock(side_effect=EOFError()),
+            runner=mock.Mock(),
+            output=output,
+            error_output=self._output(),
+        )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("Leaving TermFix", output.getvalue())
+
+    def test_interactive_ctrl_c_during_command_keeps_prompt_open(self) -> None:
+        runner = mock.Mock(side_effect=KeyboardInterrupt())
+        output = self._output()
+        with mock.patch(
+            __name__ + ".command_exists",
+            return_value="C:/Python/python.exe",
+        ):
+            code = interactive_shell(
+                input_fn=mock.Mock(side_effect=("python --version", "exit")),
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("Command interrupted", output.getvalue())
+        self.assertIn("Leaving TermFix", output.getvalue())
+
+    def test_interactive_rejects_unavailable_start_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            missing = Path(folder) / "missing"
+            code = interactive_shell(
+                cwd=missing,
+                input_fn=mock.Mock(side_effect=EOFError()),
+                output=self._output(),
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_USAGE)
+
+    def test_cli_routes_shell_action(self) -> None:
+        with mock.patch(__name__ + ".interactive_shell", return_value=EXIT_OK) as shell:
+            code = cli(["shell", "--cwd", "."])
+
+        self.assertEqual(code, EXIT_OK)
+        shell.assert_called_once_with(cwd=".")
 
     @staticmethod
     def _output():

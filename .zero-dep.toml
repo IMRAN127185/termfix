@@ -2,7 +2,7 @@
 name = "TermFix"
 track = "A"
 target_runtime = "Python 3.14.7"
-pitch = "Proof-backed, source-aware terminal corrections that never guess, edit, or execute silently."
+pitch = "An interactive, source-aware terminal that proves corrections and never executes them silently."
 
 [dependencies]
 runtime = []

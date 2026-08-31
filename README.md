@@ -10,6 +10,7 @@ The repository currently contains:
 - **Step 5:** classify command risk with deterministic rules before any future execution is considered.
 - **Step 6:** run approved commands with `shell=False`, capture failures and offer one safe corrected retry.
 - **Step 7:** detect the active source language and classify keywords, standard-library names and project-local declarations.
+- **Step 8:** provide a continuous `termfix>` terminal with safe built-ins and the complete correction pipeline.
 
 Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
 
@@ -67,6 +68,26 @@ python termfix.py context --language cpp --identifier whlie -- custom-tool sourc
 
 Deep symbol profiles are included for Python, JavaScript, Java, C and C++. TermFix can detect additional languages—including TypeScript, C#, Go, Rust, Ruby, PHP, Kotlin, Swift, Dart, Lua, Perl, R, Julia, shell and PowerShell—but does not claim deep parsing for them yet.
 
+Start the interactive TermFix terminal once and enter multiple commands:
+
+```powershell
+python termfix.py shell
+```
+
+```text
+termfix> pyhton mian.py
+
+Original:
+  pyhton mian.py
+
+Suggestion:
+  python main.py  ⓘ
+
+[y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel
+```
+
+The interactive terminal includes `cd PATH`, `pwd`, `clear`, `help` and `exit`. Its current directory is session-local, and a misspelled `cd` directory can receive the same evidence-backed correction and approval flow. `Ctrl+C` cancels the current input or interrupts a command without closing TermFix; `Ctrl+D`/EOF exits cleanly. Use `python termfix.py shell --cwd DIRECTORY` to choose the starting directory.
+
 TermFix displays the suggestion and waits for one of these choices:
 
 ```text
@@ -113,12 +134,18 @@ python -I -S termfix.py self-test
 - Python declarations are read with the standard-library AST. JavaScript, Java, C and C++ declarations use conservative patterns after comments and strings are masked.
 - Identifier corrections come only from the active language profile or declarations proven in the explicitly named source files.
 - Recognized undeclared-identifier failures receive a compact source-backed diagnostic; source code is never silently changed.
+- Interactive input is split into an argument vector without opening PowerShell, CMD, Bash or another system shell.
+- The interactive prompt reuses executable, path, stderr, safety and language-aware correction for every external command.
+- Interactive `cd`, `pwd`, `clear`, `help` and `exit` are internal operations and do not spawn shell commands.
+- The interactive directory exists only inside the TermFix session; the parent terminal directory is not changed.
+- `ⓘ` is displayed when the terminal encoding supports it, with `[i]` as the safe fallback.
+- Invalid quotes, blank input, `Ctrl+C` and EOF are handled without a traceback.
 - Weak matches are rejected.
 - Tokens that do not require correction stay unchanged.
 - Candidate ranking is deterministic.
 - `check`, `safety` and `context` cannot call the executor.
 
-Only the explicit `run` action can launch a child process. Steps 2-5 and the Step 7 `context` diagnostic remain read-only. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because `run` enforces `shell=False`, shell built-ins such as PowerShell aliases or CMD-only commands are not treated as standalone executables. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added.
+Only the explicit `run` action and external commands entered inside `shell` can launch a child process. Steps 2-5 and the Step 7 `context` diagnostic remain read-only. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added.
 
 ## Exit codes
 
@@ -132,6 +159,6 @@ Only the explicit `run` action can launch a child process. Steps 2-5 and the Ste
 | `5` | Safety blocked a high-risk command or risk-increasing correction |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-7 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-8 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.
