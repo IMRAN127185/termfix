@@ -97,13 +97,32 @@ To start immediately without rebuilding:
 python -I -S termfix.py shell
 ```
 
-From another directory, provide the source path once:
+From any PowerShell directory, use the full path and replace the dashed
+`YOUR-TERMFIX-FOLDER` placeholder with the name of the folder that contains
+`termfix.py`:
 
 ```powershell
-python -I -S "C:\path\to\termfix\termfix.py" start
+python "D:\YOUR-TERMFIX-FOLDER\termfix.py" start
 ```
 
-The TermFix session starts in the project directory. Exiting it does not change the parent PowerShell directory because a child process cannot permanently change its parent shell.
+For example, this repository is currently stored in `D:\Zero Dependency Hackathon`,
+so the complete command is:
+
+```powershell
+python "D:\Zero Dependency Hackathon\termfix.py" start
+```
+
+That one command automatically:
+
+1. locates the folder containing TermFix;
+2. runs all 206 isolated tests;
+3. creates and verifies the deterministic portable build;
+4. runs the read-only Doctor checks; and
+5. opens the interactive `termfix>` terminal only after those checks pass.
+
+If the build or Doctor fails, startup stops and the TermFix terminal is not
+opened. Exiting TermFix does not change the parent PowerShell directory because
+a child process cannot permanently change its parent shell.
 
 ## Main features
 
