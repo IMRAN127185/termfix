@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-8: proof-backed correction and an interactive terminal.
+"""TermFix Steps 2-9: proof-backed correction and a portable terminal assistant.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
@@ -9,6 +9,7 @@ argument vector with shell=False and requires explicit approval for corrections.
 Language context and code symbols are inferred from bounded, local evidence only;
 source files are inspected but never executed or modified.
 The interactive prompt retains these guarantees while accepting repeated commands.
+Portable builds are deterministic, and environment diagnostics remain read-only.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ import builtins
 from dataclasses import dataclass
 import difflib
 from enum import Enum
+import hashlib
+import io
 import json
 import keyword
 import os
@@ -31,10 +34,11 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 
 APP_NAME = "TermFix"
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -49,6 +53,12 @@ HIGH_MATCH_SCORE = 85
 WINDOWS_EXECUTABLE_EXTENSIONS = (".com", ".exe", ".bat", ".cmd")
 MAX_SOURCE_FILES = 16
 MAX_SOURCE_BYTES = 1_048_576
+PORTABLE_ARCHIVE_NAME = "termfix.pyz"
+BUILD_MANIFEST_NAME = "build-manifest.json"
+BUILD_SCHEMA_VERSION = 1
+FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+MINIMUM_PYTHON = (3, 13)
+TARGET_PYTHON = "3.14.7"
 
 
 class MatchLabel(str, Enum):
@@ -123,6 +133,14 @@ class SymbolKind(str, Enum):
     LOCAL_VARIABLE = "local variable"
     IMPORT = "import"
     UNKNOWN = "unknown"
+
+
+class DoctorStatus(str, Enum):
+    """Severity of one read-only environment diagnostic."""
+
+    OK = "OK"
+    WARN = "WARN"
+    FAIL = "FAIL"
 
 
 RISK_PRIORITY = {
@@ -505,6 +523,26 @@ class ExecutionResult:
     stdout: str
     stderr: str
     launch_error: str | None = None
+
+
+@dataclass(frozen=True)
+class PortableBuildResult:
+    """Paths and hashes produced by one deterministic portable build."""
+
+    archive_path: str
+    manifest_path: str
+    archive_sha256: str
+    source_sha256: str
+    tests_passed: int
+
+
+@dataclass(frozen=True)
+class DoctorCheck:
+    """One read-only diagnostic result shown by the doctor command."""
+
+    status: DoctorStatus
+    name: str
+    detail: str
 
 
 def selected_environment(env: dict[str, str] | None) -> dict[str, str]:
@@ -1488,6 +1526,18 @@ def safe_is_directory(path: Path) -> bool:
         return path.is_dir()
     except (OSError, ValueError):
         return False
+
+
+def path_is_indirection(path: Path) -> bool:
+    """Detect symlinks and Windows directory junctions without following them."""
+
+    try:
+        if path.is_symlink():
+            return True
+        junction_check = getattr(path, "is_junction", None)
+        return bool(junction_check()) if callable(junction_check) else False
+    except (OSError, ValueError):
+        return True
 
 
 def local_path(token: str, cwd: Path) -> Path:
@@ -3656,6 +3706,825 @@ def context_command(
     return EXIT_OK
 
 
+def sha256_bytes(data: bytes) -> str:
+    """Return a lowercase SHA-256 digest for deterministic build evidence."""
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def normalized_python_source(path: Path) -> tuple[str, bytes]:
+    """Read UTF-8 Python source and normalize platform line endings to LF."""
+
+    try:
+        if path.stat().st_size > MAX_SOURCE_BYTES:
+            raise ValueError(
+                f"Python source exceeds the {MAX_SOURCE_BYTES}-byte build limit"
+            )
+        text = path.read_text(encoding="utf-8")
+    except ValueError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"cannot read Python source {path.name!r}: {error}") from error
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        ast.parse(text, filename=path.name)
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise ValueError(f"Python source is not parseable: {error}") from error
+    return text, text.encode("utf-8")
+
+
+def source_import_audit(source_text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return direct imports and any modules outside Python's standard library."""
+
+    try:
+        tree = ast.parse(source_text, filename="termfix.py")
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise ValueError(f"Python source is not parseable: {error}") from error
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split(".", 1)[0])
+    allowed = set(sys.stdlib_module_names) | {"__future__"}
+    direct = tuple(sorted(imports))
+    return direct, tuple(name for name in direct if name not in allowed)
+
+
+def portable_archive_bytes(source: bytes) -> bytes:
+    """Create a deterministic one-entry Python ZIP application entirely in memory."""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        entry = zipfile.ZipInfo("__main__.py", date_time=FIXED_ZIP_TIMESTAMP)
+        entry.compress_type = zipfile.ZIP_STORED
+        entry.create_system = 3
+        entry.external_attr = 0o100644 << 16
+        archive.writestr(entry, source)
+    return buffer.getvalue()
+
+
+def build_manifest_bytes(
+    *,
+    archive_hash: str,
+    source_hash: str,
+    direct_imports: tuple[str, ...],
+    requirements_bytes: int,
+    tests_passed: int,
+) -> bytes:
+    """Serialize stable build evidence without timestamps or machine-specific paths."""
+
+    manifest = {
+        "application": APP_NAME,
+        "archive": {
+            "compression": "stored",
+            "entrypoint": "__main__.py",
+            "file": PORTABLE_ARCHIVE_NAME,
+            "fixed_timestamp": "1980-01-01T00:00:00Z",
+            "sha256": archive_hash,
+        },
+        "dependency_audit": {
+            "direct_imports": list(direct_imports),
+            "non_standard_library_imports": [],
+            "requirements_bytes": requirements_bytes,
+        },
+        "schema_version": BUILD_SCHEMA_VERSION,
+        "source": {
+            "file": "termfix.py",
+            "normalized_sha256": source_hash,
+        },
+        "target_python": TARGET_PYTHON,
+        "test_suite": {
+            "count": tests_passed,
+            "status": "passed",
+        },
+        "version": VERSION,
+    }
+    return (
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+
+def read_build_manifest(path: Path) -> dict[str, object]:
+    """Read a small build manifest as untrusted data with strict top-level checks."""
+
+    try:
+        if path.stat().st_size > 1_048_576:
+            raise ValueError("build manifest is unexpectedly large")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read build manifest: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("build manifest must contain a JSON object")
+    return value
+
+
+def validate_existing_build_ownership(output_directory: Path) -> None:
+    """Refuse to replace incomplete, unknown, symlinked, or manually changed output."""
+
+    archive_path = output_directory / PORTABLE_ARCHIVE_NAME
+    manifest_path = output_directory / BUILD_MANIFEST_NAME
+    if path_is_indirection(archive_path) or path_is_indirection(manifest_path):
+        raise ValueError("refusing to replace redirected build output")
+    archive_exists = archive_path.exists()
+    manifest_exists = manifest_path.exists()
+    if not archive_exists and not manifest_exists:
+        return
+    if not archive_exists or not manifest_exists:
+        raise ValueError("existing build is incomplete; move it aside before rebuilding")
+    manifest = read_build_manifest(manifest_path)
+    archive = manifest.get("archive")
+    if (
+        manifest.get("application") != APP_NAME
+        or not isinstance(archive, dict)
+        or archive.get("file") != PORTABLE_ARCHIVE_NAME
+        or not isinstance(archive.get("sha256"), str)
+    ):
+        raise ValueError("existing build is not recognized as TermFix-owned output")
+    try:
+        existing_hash = sha256_bytes(archive_path.read_bytes())
+    except OSError as error:
+        raise ValueError(f"cannot verify existing portable archive: {error}") from error
+    if existing_hash != archive["sha256"]:
+        raise ValueError("existing portable archive was modified; refusing to overwrite it")
+
+
+def ensure_build_directory(path: Path) -> None:
+    """Create only the exact build directory and refuse indirection through symlinks."""
+
+    if path_is_indirection(path):
+        raise ValueError("build directory must not be a symlink or junction")
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError("build output path exists but is not a directory")
+        return
+    try:
+        path.mkdir(parents=False, exist_ok=False)
+    except OSError as error:
+        raise ValueError(f"cannot create build directory: {error}") from error
+
+
+def staged_file(path: Path, data: bytes) -> Path:
+    """Write and flush one temporary file beside its final atomic destination."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".termfix-build-",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return temporary
+
+
+def atomic_write_build(
+    archive_path: Path,
+    archive_data: bytes,
+    manifest_path: Path,
+    manifest_data: bytes,
+) -> None:
+    """Stage both outputs and roll back the archive if the second replace fails."""
+
+    old_archive = archive_path.read_bytes() if archive_path.exists() else None
+    staged_archive = staged_file(archive_path, archive_data)
+    staged_manifest = staged_file(manifest_path, manifest_data)
+    archive_replaced = False
+    try:
+        os.replace(staged_archive, archive_path)
+        archive_replaced = True
+        os.replace(staged_manifest, manifest_path)
+    except Exception:
+        if archive_replaced:
+            try:
+                if old_archive is None:
+                    archive_path.unlink(missing_ok=True)
+                else:
+                    rollback = staged_file(archive_path, old_archive)
+                    os.replace(rollback, archive_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        for temporary in (staged_archive, staged_manifest):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def validate_portable_build_inputs(
+    source_path: Path,
+    requirements_path: Path,
+) -> tuple[str, bytes, tuple[str, ...]]:
+    """Validate source and dependency proof before tests or build-directory writes."""
+
+    if path_is_indirection(source_path) or not source_path.is_file():
+        raise ValueError("build source must be a regular, non-symlinked Python file")
+    source_text, source_bytes = normalized_python_source(source_path)
+    direct_imports, non_standard = source_import_audit(source_text)
+    if non_standard:
+        raise ValueError(
+            "non-standard-library imports found: " + ", ".join(non_standard)
+        )
+    if path_is_indirection(requirements_path) or not requirements_path.is_file():
+        raise ValueError("requirements.txt must be a regular, non-symlinked file")
+    try:
+        requirements_size = requirements_path.stat().st_size
+    except OSError as error:
+        raise ValueError(f"cannot verify requirements.txt: {error}") from error
+    if requirements_size != 0:
+        raise ValueError("requirements.txt must be exactly empty for a portable build")
+    return source_text, source_bytes, direct_imports
+
+
+def create_portable_build(
+    *,
+    source_path: Path,
+    requirements_path: Path,
+    output_directory: Path,
+    tests_passed: int,
+) -> PortableBuildResult:
+    """Create deterministic archive and manifest files after validation succeeds."""
+
+    if tests_passed <= 0:
+        raise ValueError("portable builds require positive passing-test evidence")
+    _source_text, source_bytes, direct_imports = validate_portable_build_inputs(
+        source_path,
+        requirements_path,
+    )
+    source_hash = sha256_bytes(source_bytes)
+    archive_data = portable_archive_bytes(source_bytes)
+    archive_hash = sha256_bytes(archive_data)
+    manifest_data = build_manifest_bytes(
+        archive_hash=archive_hash,
+        source_hash=source_hash,
+        direct_imports=direct_imports,
+        requirements_bytes=0,
+        tests_passed=tests_passed,
+    )
+
+    ensure_build_directory(output_directory)
+    validate_existing_build_ownership(output_directory)
+    archive_path = output_directory / PORTABLE_ARCHIVE_NAME
+    manifest_path = output_directory / BUILD_MANIFEST_NAME
+    try:
+        atomic_write_build(archive_path, archive_data, manifest_path, manifest_data)
+    except OSError as error:
+        raise ValueError(f"cannot write portable build atomically: {error}") from error
+    return PortableBuildResult(
+        archive_path=str(archive_path.resolve()),
+        manifest_path=str(manifest_path.resolve()),
+        archive_sha256=archive_hash,
+        source_sha256=source_hash,
+        tests_passed=tests_passed,
+    )
+
+
+def embedded_test_count() -> int:
+    """Return the deterministic number of embedded TermFix test cases."""
+
+    return unittest.defaultTestLoader.loadTestsFromTestCase(TermFixTests).countTestCases()
+
+
+def build_command(
+    *,
+    source_path: Path | None = None,
+    requirements_path: Path | None = None,
+    output_directory: Path | None = None,
+    runner: object | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Run isolated tests, then create the portable build inside dist only."""
+
+    source = Path(__file__).resolve() if source_path is None else Path(source_path)
+    if not source.is_file() or source.suffix.casefold() != ".py":
+        print("termfix: build must be run from the termfix.py source file", file=error_output)
+        return EXIT_USAGE
+    requirements = (
+        source.parent / "requirements.txt"
+        if requirements_path is None
+        else Path(requirements_path)
+    )
+    destination = (
+        source.parent / "dist" if output_directory is None else Path(output_directory)
+    )
+    try:
+        validate_portable_build_inputs(source, requirements)
+    except ValueError as error:
+        print(f"Build blocked: {error}", file=error_output)
+        return EXIT_BLOCKED
+
+    test_count = embedded_test_count()
+    active_runner = subprocess.run if runner is None else runner
+    test_argv = [sys.executable, "-I", "-S", str(source), "self-test"]
+    print(f"Running {test_count} isolated embedded tests before building...", file=output)
+    try:
+        completed = active_runner(
+            test_argv,
+            shell=False,
+            cwd=str(source.parent),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+    except OSError as error:
+        print(f"Build blocked: test process could not start: {error}", file=error_output)
+        return EXIT_BLOCKED
+    if int(completed.returncode) != 0:
+        print("Build blocked: embedded tests failed; no build was created.", file=error_output)
+        return EXIT_BLOCKED
+
+    try:
+        result = create_portable_build(
+            source_path=source,
+            requirements_path=requirements,
+            output_directory=destination,
+            tests_passed=test_count,
+        )
+    except ValueError as error:
+        print(f"Build blocked: {error}", file=error_output)
+        return EXIT_BLOCKED
+    print("Portable build created:", file=output)
+    print(f"  Archive: {result.archive_path}", file=output)
+    print(f"  Manifest: {result.manifest_path}", file=output)
+    print(f"  SHA-256: {result.archive_sha256}", file=output)
+    print(f"  Tests: {result.tests_passed} passed", file=output)
+    print("No persistent build files outside the build directory were written.", file=output)
+    return EXIT_OK
+
+
+def portable_artifact_checks(
+    archive_path: Path,
+    manifest_path: Path,
+    *,
+    expected_source_hash: str | None,
+) -> tuple[tuple[DoctorCheck, ...], dict[str, object] | None, bytes | None]:
+    """Validate archive structure, hashes, syntax and test evidence without execution."""
+
+    checks: list[DoctorCheck] = []
+    if not archive_path.exists() and not manifest_path.exists():
+        checks.extend(
+            (
+                DoctorCheck(
+                    DoctorStatus.WARN,
+                    "Portable build",
+                    "not built yet; run 'python termfix.py build'",
+                ),
+                DoctorCheck(
+                    DoctorStatus.WARN,
+                    "Recorded tests",
+                    "no build manifest is available",
+                ),
+            )
+        )
+        return tuple(checks), None, None
+    if path_is_indirection(archive_path) or path_is_indirection(manifest_path):
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                "archive and manifest must not be symlinks or redirected paths",
+            )
+        )
+        return tuple(checks), None, None
+    if not archive_path.is_file() or not manifest_path.is_file():
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                "archive or manifest is missing",
+            )
+        )
+        return tuple(checks), None, None
+
+    try:
+        manifest = read_build_manifest(manifest_path)
+        if archive_path.stat().st_size > 8 * 1_048_576:
+            raise ValueError("portable archive is unexpectedly large")
+        archive_data = archive_path.read_bytes()
+    except (OSError, ValueError) as error:
+        checks.append(DoctorCheck(DoctorStatus.FAIL, "Portable build", str(error)))
+        return tuple(checks), None, None
+    archive_section = manifest.get("archive")
+    source_section = manifest.get("source")
+    dependency_section = manifest.get("dependency_audit")
+    test_section = manifest.get("test_suite")
+    if (
+        manifest.get("application") != APP_NAME
+        or manifest.get("schema_version") != BUILD_SCHEMA_VERSION
+        or manifest.get("target_python") != TARGET_PYTHON
+        or not isinstance(archive_section, dict)
+        or not isinstance(source_section, dict)
+        or not isinstance(dependency_section, dict)
+        or not isinstance(test_section, dict)
+    ):
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                "manifest schema or application identity is invalid",
+            )
+        )
+        return tuple(checks), manifest, None
+
+    if (
+        archive_section.get("file") != PORTABLE_ARCHIVE_NAME
+        or archive_section.get("entrypoint") != "__main__.py"
+        or archive_section.get("compression") != "stored"
+        or archive_section.get("fixed_timestamp") != "1980-01-01T00:00:00Z"
+        or source_section.get("file") != "termfix.py"
+    ):
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                "manifest build-format evidence is invalid",
+            )
+        )
+        return tuple(checks), manifest, None
+
+    recorded_archive_hash = archive_section.get("sha256")
+    actual_archive_hash = sha256_bytes(archive_data)
+    if recorded_archive_hash != actual_archive_hash:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                "archive SHA-256 does not match the manifest",
+            )
+        )
+        return tuple(checks), manifest, None
+    archived_source: bytes | None = None
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_data), "r") as archive:
+            entries = archive.infolist()
+            if len(entries) != 1 or entries[0].filename != "__main__.py":
+                raise ValueError("archive must contain only __main__.py")
+            entry = entries[0]
+            if entry.date_time != FIXED_ZIP_TIMESTAMP:
+                raise ValueError("archive timestamp is not reproducible")
+            if entry.compress_type != zipfile.ZIP_STORED:
+                raise ValueError("archive compression mode is not deterministic")
+            if entry.create_system != 3 or (entry.external_attr >> 16) & 0o777 != 0o644:
+                raise ValueError("archive entry metadata is not reproducible")
+            if entry.file_size > 4 * 1_048_576:
+                raise ValueError("portable entrypoint is unexpectedly large")
+            if archive.testzip() is not None:
+                raise ValueError("archive integrity check failed")
+            archived_source = archive.read("__main__.py")
+        source_text = archived_source.decode("utf-8")
+        compile(source_text, "__main__.py", "exec", dont_inherit=True)
+    except (OSError, UnicodeError, ValueError, SyntaxError, zipfile.BadZipFile) as error:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                f"archive is not a valid loadable Python application: {error}",
+            )
+        )
+        return tuple(checks), manifest, archived_source
+
+    archived_source_hash = sha256_bytes(archived_source)
+    try:
+        direct_imports, non_standard = source_import_audit(source_text)
+    except ValueError as error:
+        checks.append(DoctorCheck(DoctorStatus.FAIL, "Dependency proof", str(error)))
+    else:
+        recorded_imports = dependency_section.get("direct_imports")
+        recorded_non_standard = dependency_section.get("non_standard_library_imports")
+        recorded_requirements_bytes = dependency_section.get("requirements_bytes")
+        dependency_matches = (
+            recorded_imports == list(direct_imports)
+            and recorded_non_standard == []
+            and recorded_requirements_bytes == 0
+            and not non_standard
+        )
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.OK if dependency_matches else DoctorStatus.FAIL,
+                "Dependency proof",
+                (
+                    f"{len(direct_imports)} archived imports are standard-library modules; "
+                    "requirements recorded empty"
+                    if dependency_matches
+                    else "manifest dependency evidence does not match the archived source"
+                ),
+            )
+        )
+    if source_section.get("normalized_sha256") != archived_source_hash:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                "entrypoint source hash does not match the manifest",
+            )
+        )
+    elif expected_source_hash is not None and archived_source_hash != expected_source_hash:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                "portable build is stale compared with termfix.py",
+            )
+        )
+    elif manifest.get("version") != VERSION:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Portable build",
+                f"manifest version {manifest.get('version')!r} does not match {VERSION}",
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.OK,
+                "Portable build",
+                f"loadable deterministic archive; SHA-256 {actual_archive_hash[:12]}...",
+            )
+        )
+
+    test_count = test_section.get("count")
+    if test_section.get("status") == "passed" and isinstance(test_count, int) and test_count > 0:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.OK,
+                "Recorded tests",
+                f"build recorded {test_count} passing embedded tests",
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Recorded tests",
+                "manifest has no valid passing-test evidence",
+            )
+        )
+    return tuple(checks), manifest, archived_source
+
+
+def automatic_doctor_paths() -> tuple[Path | None, Path | None]:
+    """Identify source mode or portable-archive mode without changing the filesystem."""
+
+    launch_path = Path(sys.argv[0])
+    try:
+        if launch_path.suffix.casefold() == ".pyz" and launch_path.is_file():
+            return None, launch_path.resolve()
+    except (OSError, ValueError):
+        pass
+    module_path = Path(__file__)
+    try:
+        if module_path.is_file():
+            return module_path.resolve(), None
+    except (OSError, ValueError):
+        pass
+    return None, None
+
+
+def render_doctor(checks: tuple[DoctorCheck, ...]) -> str:
+    """Render concise read-only diagnostic results and the overall decision."""
+
+    lines = ["TermFix Doctor", ""]
+    for check in checks:
+        lines.append(f"[{check.status.value}] {check.name}: {check.detail}")
+    failures = sum(check.status is DoctorStatus.FAIL for check in checks)
+    warnings = sum(check.status is DoctorStatus.WARN for check in checks)
+    lines.append("")
+    if failures:
+        lines.append(f"Result: NOT READY ({failures} failure(s), {warnings} warning(s))")
+    elif warnings:
+        lines.append(f"Result: READY WITH {warnings} WARNING(S)")
+    else:
+        lines.append("Result: READY")
+    lines.append("Doctor inspected local evidence only; nothing was executed or modified.")
+    return "\n".join(lines)
+
+
+def doctor_command(
+    *,
+    source_path: Path | None = None,
+    archive_path: Path | None = None,
+    requirements_path: Path | None = None,
+    build_directory: Path | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    env: dict[str, str] | None = None,
+    output: object = sys.stdout,
+) -> int:
+    """Diagnose TermFix and a portable build using read-only operations only."""
+
+    if source_path is None and archive_path is None:
+        source_path, archive_path = automatic_doctor_paths()
+    source = Path(source_path) if source_path is not None else None
+    portable = Path(archive_path) if archive_path is not None else None
+    checks: list[DoctorCheck] = []
+
+    runtime = sys.version_info
+    runtime_text = f"{runtime.major}.{runtime.minor}.{runtime.micro}"
+    if (runtime.major, runtime.minor) >= MINIMUM_PYTHON:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.OK,
+                "Python runtime",
+                f"{runtime_text} is compatible; competition target is {TARGET_PYTHON}",
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Python runtime",
+                f"{runtime_text} is below required {MINIMUM_PYTHON[0]}.{MINIMUM_PYTHON[1]}",
+            )
+        )
+    checks.append(DoctorCheck(DoctorStatus.OK, "TermFix version", VERSION))
+
+    inspected_cwd = Path.cwd() if cwd is None else Path(cwd)
+    if safe_is_directory(inspected_cwd) and os.access(inspected_cwd, os.R_OK):
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.OK,
+                "Current directory",
+                "readable",
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Current directory",
+                "not a readable directory",
+            )
+        )
+
+    environment = selected_environment(env)
+    path_value = environment_value(environment, "PATH")
+    resolved_python = None
+    if path_value:
+        for candidate in (Path(sys.executable).name, "python", "python3", "py"):
+            resolved_python = shutil.which(candidate, path=path_value)
+            if resolved_python:
+                break
+    if resolved_python:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.OK,
+                "PATH discovery",
+                f"Python launcher found as {Path(resolved_python).name}",
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.WARN,
+                "PATH discovery",
+                "no Python launcher was found on PATH; use the current interpreter explicitly",
+            )
+        )
+
+    indicator = information_indicator(output)
+    checks.append(
+        DoctorCheck(
+            DoctorStatus.OK if indicator == "ⓘ" else DoctorStatus.WARN,
+            "Information indicator",
+            "Unicode ⓘ supported" if indicator == "ⓘ" else "using ASCII [i] fallback",
+        )
+    )
+
+    current_source_bytes: bytes | None = None
+    source_text: str | None = None
+    if source is not None:
+        try:
+            source_text, current_source_bytes = normalized_python_source(source)
+            checks.append(DoctorCheck(DoctorStatus.OK, "Source syntax", "termfix.py is parseable"))
+        except ValueError as error:
+            checks.append(DoctorCheck(DoctorStatus.FAIL, "Source syntax", str(error)))
+    elif portable is None:
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.FAIL,
+                "Application source",
+                "could not identify termfix.py or a running .pyz archive",
+            )
+        )
+
+    if source_text is not None:
+        try:
+            direct_imports, non_standard = source_import_audit(source_text)
+        except ValueError as error:
+            direct_imports, non_standard = (), ("audit-error",)
+            checks.append(DoctorCheck(DoctorStatus.FAIL, "Import audit", str(error)))
+        else:
+            if non_standard:
+                checks.append(
+                    DoctorCheck(
+                        DoctorStatus.FAIL,
+                        "Import audit",
+                        "non-standard imports: " + ", ".join(non_standard),
+                    )
+                )
+            else:
+                checks.append(
+                    DoctorCheck(
+                        DoctorStatus.OK,
+                        "Import audit",
+                        f"{len(direct_imports)} direct imports are standard-library modules",
+                    )
+                )
+        requirements = (
+            source.parent / "requirements.txt"
+            if requirements_path is None
+            else Path(requirements_path)
+        )
+        try:
+            requirements_size = requirements.stat().st_size
+        except OSError as error:
+            checks.append(
+                DoctorCheck(DoctorStatus.FAIL, "requirements.txt", f"cannot verify: {error}")
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    DoctorStatus.OK if requirements_size == 0 else DoctorStatus.FAIL,
+                    "requirements.txt",
+                    "exactly empty" if requirements_size == 0 else f"contains {requirements_size} bytes",
+                )
+            )
+
+    if portable is None and source is not None:
+        build_root = source.parent / "dist" if build_directory is None else Path(build_directory)
+        portable = build_root / PORTABLE_ARCHIVE_NAME
+        manifest_path = build_root / BUILD_MANIFEST_NAME
+    elif portable is not None:
+        manifest_path = portable.parent / BUILD_MANIFEST_NAME
+    else:
+        manifest_path = Path(BUILD_MANIFEST_NAME)
+
+    expected_hash = (
+        sha256_bytes(current_source_bytes) if current_source_bytes is not None else None
+    )
+    artifact_checks, manifest, archived_source = portable_artifact_checks(
+        portable,
+        manifest_path,
+        expected_source_hash=expected_hash,
+    )
+    checks.extend(artifact_checks)
+
+    if source_text is None and archived_source is not None:
+        try:
+            archived_text = archived_source.decode("utf-8")
+            direct_imports, non_standard = source_import_audit(archived_text)
+        except (UnicodeError, ValueError) as error:
+            checks.append(DoctorCheck(DoctorStatus.FAIL, "Import audit", str(error)))
+        else:
+            checks.append(
+                DoctorCheck(
+                    DoctorStatus.OK if not non_standard else DoctorStatus.FAIL,
+                    "Import audit",
+                    (
+                        f"{len(direct_imports)} archived imports are standard-library modules"
+                        if not non_standard
+                        else "non-standard imports: " + ", ".join(non_standard)
+                    ),
+                )
+            )
+        dependency_section = manifest.get("dependency_audit") if manifest else None
+        requirements_bytes = (
+            dependency_section.get("requirements_bytes")
+            if isinstance(dependency_section, dict)
+            else None
+        )
+        checks.append(
+            DoctorCheck(
+                DoctorStatus.OK if requirements_bytes == 0 else DoctorStatus.FAIL,
+                "Recorded requirements",
+                "build recorded an empty requirements.txt"
+                if requirements_bytes == 0
+                else "build manifest does not prove an empty requirements.txt",
+            )
+        )
+
+    rendered = render_doctor(tuple(checks))
+    print(rendered, file=output)
+    return (
+        EXIT_NOT_FOUND
+        if any(check.status is DoctorStatus.FAIL for check in checks)
+        else EXIT_OK
+    )
+
+
 def split_windows_interactive_command(line: str) -> tuple[str, ...]:
     """Split a Windows-style line while preserving ordinary path backslashes."""
 
@@ -4015,6 +4884,15 @@ def make_parser() -> argparse.ArgumentParser:
         help="start in this directory instead of the current directory",
     )
 
+    actions.add_parser(
+        "build",
+        help="test and create a deterministic portable archive in dist",
+    )
+    actions.add_parser(
+        "doctor",
+        help="inspect local runtime and build evidence without changing anything",
+    )
+
     actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
 
@@ -4052,6 +4930,10 @@ def cli(argv: list[str] | None = None) -> int:
         )
     if args.action == "shell":
         return interactive_shell(cwd=args.cwd)
+    if args.action == "build":
+        return build_command()
+    if args.action == "doctor":
+        return doctor_command()
     return EXIT_USAGE
 
 
@@ -6054,6 +6936,504 @@ class TermFixTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_OK)
         shell.assert_called_once_with(cwd=".")
+
+    def test_portable_archive_is_reproducible_and_has_one_fixed_entry(self) -> None:
+        source = b"from __future__ import annotations\nimport sys\nprint(sys.version)\n"
+        first = portable_archive_bytes(source)
+        second = portable_archive_bytes(source)
+
+        self.assertEqual(first, second)
+        with zipfile.ZipFile(io.BytesIO(first), "r") as archive:
+            self.assertEqual(archive.namelist(), ["__main__.py"])
+            entry = archive.infolist()[0]
+            self.assertEqual(entry.date_time, FIXED_ZIP_TIMESTAMP)
+            self.assertEqual(entry.compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(entry.create_system, 3)
+            self.assertEqual((entry.external_attr >> 16) & 0o777, 0o644)
+            self.assertEqual(archive.read("__main__.py"), source)
+
+    def test_portable_build_normalizes_line_endings_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_bytes(b"import sys\r\nprint(sys.version)\r\n")
+            requirements.write_bytes(b"")
+
+            first = create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=7,
+            )
+            first_archive = (destination / PORTABLE_ARCHIVE_NAME).read_bytes()
+            first_manifest = (destination / BUILD_MANIFEST_NAME).read_bytes()
+            second = create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=7,
+            )
+
+            self.assertEqual(first.archive_sha256, second.archive_sha256)
+            self.assertEqual(
+                first_archive,
+                (destination / PORTABLE_ARCHIVE_NAME).read_bytes(),
+            )
+            self.assertEqual(
+                first_manifest,
+                (destination / BUILD_MANIFEST_NAME).read_bytes(),
+            )
+            with zipfile.ZipFile(destination / PORTABLE_ARCHIVE_NAME) as archive:
+                self.assertEqual(
+                    archive.read("__main__.py"),
+                    b"import sys\nprint(sys.version)\n",
+                )
+
+    def test_build_manifest_contains_stable_audit_evidence_only(self) -> None:
+        manifest = json.loads(
+            build_manifest_bytes(
+                archive_hash="a" * 64,
+                source_hash="b" * 64,
+                direct_imports=("argparse", "sys"),
+                requirements_bytes=0,
+                tests_passed=12,
+            )
+        )
+
+        rendered = json.dumps(manifest, sort_keys=True)
+        self.assertEqual(manifest["test_suite"], {"count": 12, "status": "passed"})
+        self.assertEqual(manifest["dependency_audit"]["requirements_bytes"], 0)
+        self.assertNotIn(str(Path.cwd()), rendered)
+        self.assertNotIn("built_at", rendered)
+        self.assertNotIn("created_at", rendered)
+
+    def test_build_rejects_nonempty_requirements_before_creating_output(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_text("requests\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exactly empty"):
+                create_portable_build(
+                    source_path=source,
+                    requirements_path=requirements,
+                    output_directory=destination,
+                    tests_passed=1,
+                )
+
+            self.assertFalse(destination.exists())
+
+    def test_build_rejects_non_standard_import_before_creating_output(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import definitely_not_stdlib\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+
+            with self.assertRaisesRegex(ValueError, "non-standard-library imports"):
+                create_portable_build(
+                    source_path=source,
+                    requirements_path=requirements,
+                    output_directory=destination,
+                    tests_passed=1,
+                )
+
+            self.assertFalse(destination.exists())
+
+    def test_build_rejects_oversized_source_before_reading_it(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            source.write_bytes(b"#" * (MAX_SOURCE_BYTES + 1))
+            requirements.write_bytes(b"")
+
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                create_portable_build(
+                    source_path=source,
+                    requirements_path=requirements,
+                    output_directory=root / "dist",
+                    tests_passed=1,
+                )
+
+            self.assertFalse((root / "dist").exists())
+
+    def test_build_rejects_symlinked_source_when_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            actual = root / "actual.py"
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            actual.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            try:
+                source.symlink_to(actual)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "non-symlinked"):
+                create_portable_build(
+                    source_path=source,
+                    requirements_path=requirements,
+                    output_directory=root / "dist",
+                    tests_passed=1,
+                )
+
+    def test_build_rejects_symlinked_requirements_when_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            actual = root / "actual-requirements.txt"
+            requirements = root / "requirements.txt"
+            source.write_text("import sys\n", encoding="utf-8")
+            actual.write_bytes(b"")
+            try:
+                requirements.symlink_to(actual)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "non-symlinked"):
+                create_portable_build(
+                    source_path=source,
+                    requirements_path=requirements,
+                    output_directory=root / "dist",
+                    tests_passed=1,
+                )
+
+    def test_build_refuses_incomplete_or_changed_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            destination.mkdir()
+            (destination / PORTABLE_ARCHIVE_NAME).write_bytes(b"unknown")
+
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                create_portable_build(
+                    source_path=source,
+                    requirements_path=requirements,
+                    output_directory=destination,
+                    tests_passed=1,
+                )
+
+            (destination / PORTABLE_ARCHIVE_NAME).unlink()
+            create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=1,
+            )
+            (destination / PORTABLE_ARCHIVE_NAME).write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "was modified"):
+                create_portable_build(
+                    source_path=source,
+                    requirements_path=requirements,
+                    output_directory=destination,
+                    tests_passed=1,
+                )
+
+    def test_build_allows_a_source_change_for_managed_output(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            first = create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=2,
+            )
+            source.write_text("import sys\nprint(sys.version)\n", encoding="utf-8")
+            second = create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=2,
+            )
+
+            self.assertNotEqual(first.archive_sha256, second.archive_sha256)
+
+    def test_atomic_build_rolls_back_archive_if_manifest_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive = root / PORTABLE_ARCHIVE_NAME
+            manifest = root / BUILD_MANIFEST_NAME
+            archive.write_bytes(b"old archive")
+            manifest.write_bytes(b"old manifest")
+            real_replace = os.replace
+            calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated manifest failure")
+                return real_replace(source, destination)
+
+            with mock.patch(__name__ + ".os.replace", side_effect=fail_second_replace):
+                with self.assertRaisesRegex(OSError, "simulated manifest failure"):
+                    atomic_write_build(archive, b"new archive", manifest, b"new manifest")
+
+            self.assertEqual(archive.read_bytes(), b"old archive")
+            self.assertEqual(manifest.read_bytes(), b"old manifest")
+            self.assertEqual(list(root.glob(".termfix-build-*.tmp")), [])
+
+    def test_build_command_runs_isolated_tests_with_shell_false(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\nprint(sys.version)\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            runner = mock.Mock(
+                return_value=subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
+            )
+            output = self._output()
+
+            code = build_command(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                runner=runner,
+                output=output,
+                error_output=self._output(),
+            )
+
+            self.assertEqual(code, EXIT_OK)
+            argv = runner.call_args.args[0]
+            self.assertEqual(argv[:3], [sys.executable, "-I", "-S"])
+            self.assertEqual(argv[-1], "self-test")
+            self.assertIs(runner.call_args.kwargs["shell"], False)
+            self.assertTrue((destination / PORTABLE_ARCHIVE_NAME).is_file())
+            self.assertTrue((destination / BUILD_MANIFEST_NAME).is_file())
+            self.assertIn("Portable build created", output.getvalue())
+
+    def test_failed_prebuild_tests_leave_no_build_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            runner = mock.Mock(return_value=subprocess.CompletedProcess([], 1))
+
+            code = build_command(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                runner=runner,
+                output=self._output(),
+                error_output=self._output(),
+            )
+
+            self.assertEqual(code, EXIT_BLOCKED)
+            self.assertFalse(destination.exists())
+
+    def test_current_source_can_run_as_portable_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Path(folder) / PORTABLE_ARCHIVE_NAME
+            _text, source = normalized_python_source(Path(__file__))
+            archive.write_bytes(portable_archive_bytes(source))
+
+            completed = subprocess.run(
+                [sys.executable, "-I", "-S", str(archive), "--version"],
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, EXIT_OK, completed.stderr)
+            self.assertIn(VERSION, completed.stdout)
+
+    def test_cli_routes_build_and_doctor_actions(self) -> None:
+        with mock.patch(__name__ + ".build_command", return_value=EXIT_OK) as build:
+            self.assertEqual(cli(["build"]), EXIT_OK)
+        with mock.patch(__name__ + ".doctor_command", return_value=EXIT_OK) as doctor:
+            self.assertEqual(cli(["doctor"]), EXIT_OK)
+
+        build.assert_called_once_with()
+        doctor.assert_called_once_with()
+
+    def test_doctor_is_read_only_and_missing_build_is_only_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            output = self._output()
+
+            with mock.patch(
+                __name__ + ".subprocess.run",
+                side_effect=AssertionError("doctor must not execute subprocesses"),
+            ):
+                code = doctor_command(
+                    source_path=source,
+                    requirements_path=requirements,
+                    build_directory=root / "dist",
+                    cwd=root,
+                    env={},
+                    output=output,
+                )
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+            self.assertEqual(code, EXIT_OK)
+            self.assertEqual(before, after)
+            self.assertFalse((root / "dist").exists())
+            self.assertIn("READY WITH", output.getvalue())
+            self.assertIn("nothing was executed or modified", output.getvalue())
+
+    def test_doctor_accepts_valid_source_and_portable_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\nprint(sys.version)\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=23,
+            )
+            output = self._output()
+
+            code = doctor_command(
+                source_path=source,
+                requirements_path=requirements,
+                build_directory=destination,
+                cwd=root,
+                env={},
+                output=output,
+            )
+
+            self.assertEqual(code, EXIT_OK)
+            self.assertIn("build recorded 23 passing embedded tests", output.getvalue())
+            self.assertIn("loadable deterministic archive", output.getvalue())
+
+    def test_doctor_can_validate_archive_mode_without_source_file(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=5,
+            )
+            output = self._output()
+
+            code = doctor_command(
+                archive_path=destination / PORTABLE_ARCHIVE_NAME,
+                cwd=root,
+                env={},
+                output=output,
+            )
+
+            self.assertEqual(code, EXIT_OK)
+            self.assertIn("Recorded requirements", output.getvalue())
+            self.assertIn("archived imports", output.getvalue())
+
+    def test_doctor_rejects_corrupted_or_stale_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=3,
+            )
+            source.write_text("import sys\nprint(sys.version)\n", encoding="utf-8")
+            stale_output = self._output()
+            stale_code = doctor_command(
+                source_path=source,
+                requirements_path=requirements,
+                build_directory=destination,
+                cwd=root,
+                env={},
+                output=stale_output,
+            )
+            source.write_text("import sys\n", encoding="utf-8")
+            (destination / PORTABLE_ARCHIVE_NAME).write_bytes(b"corrupted")
+            corrupt_output = self._output()
+            corrupt_code = doctor_command(
+                source_path=source,
+                requirements_path=requirements,
+                build_directory=destination,
+                cwd=root,
+                env={},
+                output=corrupt_output,
+            )
+
+            self.assertEqual(stale_code, EXIT_NOT_FOUND)
+            self.assertIn("stale", stale_output.getvalue())
+            self.assertEqual(corrupt_code, EXIT_NOT_FOUND)
+            self.assertIn("does not match", corrupt_output.getvalue())
+
+    def test_doctor_rejects_tampered_dependency_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "termfix.py"
+            requirements = root / "requirements.txt"
+            destination = root / "dist"
+            source.write_text("import sys\n", encoding="utf-8")
+            requirements.write_bytes(b"")
+            create_portable_build(
+                source_path=source,
+                requirements_path=requirements,
+                output_directory=destination,
+                tests_passed=4,
+            )
+            manifest_path = destination / BUILD_MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["dependency_audit"]["direct_imports"] = []
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            output = self._output()
+
+            code = doctor_command(
+                archive_path=destination / PORTABLE_ARCHIVE_NAME,
+                cwd=root,
+                env={},
+                output=output,
+            )
+
+            self.assertEqual(code, EXIT_NOT_FOUND)
+            self.assertIn("dependency evidence does not match", output.getvalue())
 
     @staticmethod
     def _output():

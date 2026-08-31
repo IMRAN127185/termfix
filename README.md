@@ -11,6 +11,7 @@ The repository currently contains:
 - **Step 6:** run approved commands with `shell=False`, capture failures and offer one safe corrected retry.
 - **Step 7:** detect the active source language and classify keywords, standard-library names and project-local declarations.
 - **Step 8:** provide a continuous `termfix>` terminal with safe built-ins and the complete correction pipeline.
+- **Step 9:** test and package TermFix reproducibly, then diagnose its local environment without changing it.
 
 Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
 
@@ -110,6 +111,34 @@ Run the embedded standard-library tests:
 python -I -S termfix.py self-test
 ```
 
+## Portable build and doctor
+
+Create a tested portable build:
+
+```powershell
+python -I -S termfix.py build
+```
+
+The build command first runs the complete embedded test suite in an isolated Python process. It writes exactly two persistent files inside `dist/` only after the tests pass:
+
+- `dist/termfix.pyz` — a portable Python ZIP application.
+- `dist/build-manifest.json` — hashes and dependency/test evidence for that archive.
+
+Run the portable application wherever a compatible Python interpreter is available:
+
+```powershell
+python -I -S dist/termfix.pyz shell
+```
+
+Inspect the current runtime, dependency proof, source, build hash, archive structure and recorded test result:
+
+```powershell
+python -I -S termfix.py doctor
+python -I -S dist/termfix.pyz doctor
+```
+
+`doctor` is strictly read-only. It does not execute the archived program, run tests, install anything, edit `PATH`, modify shell profiles or write files. A missing portable build is a warning; corrupted, modified or stale build evidence is a failure.
+
 ## Current guarantees
 
 - Standard library only; `requirements.txt` is empty.
@@ -140,25 +169,32 @@ python -I -S termfix.py self-test
 - The interactive directory exists only inside the TermFix session; the parent terminal directory is not changed.
 - `ⓘ` is displayed when the terminal encoding supports it, with `[i]` as the safe fallback.
 - Invalid quotes, blank input, `Ctrl+C` and EOF are handled without a traceback.
+- A portable build is created only after the full test suite passes under `python -I -S` with `shell=False`.
+- The portable archive contains exactly one uncompressed `__main__.py` entry with normalized LF line endings and a fixed 1980 timestamp.
+- Rebuilding unchanged source produces byte-for-byte identical archive and manifest files.
+- The build manifest records SHA-256 hashes, standard-library import proof, empty-requirements proof and the passing test count without machine-specific paths or build times.
+- Existing incomplete, unknown, symlinked or manually modified build output is never overwritten.
+- Build files are staged and replaced atomically; an archive replacement is rolled back if the manifest replacement fails.
+- `doctor` validates local evidence without executing subprocesses or modifying the filesystem.
 - Weak matches are rejected.
 - Tokens that do not require correction stay unchanged.
 - Candidate ranking is deterministic.
 - `check`, `safety` and `context` cannot call the executor.
 
-Only the explicit `run` action and external commands entered inside `shell` can launch a child process. Steps 2-5 and the Step 7 `context` diagnostic remain read-only. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added.
+Only the explicit `run` action, external commands entered inside `shell`, and the isolated self-test started by `build` can launch a child process. The `check`, `safety`, `context` and `doctor` actions remain read-only. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all command execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added. `build` creates only the `dist` directory and its two declared files; it never installs TermFix or changes system configuration.
 
 ## Exit codes
 
 | Code | Meaning |
 |---:|---|
 | `0` | Successful read-only check/classification; no correction required |
-| `1` | Wrapped command failed, launch failed or no reliable correction was found |
+| `1` | Wrapped command failed, launch failed, no reliable correction was found, or `doctor` found invalid evidence |
 | `2` | Invalid CLI usage |
 | `3` | Reliable correction available |
 | `4` | User cancelled or interrupted the operation |
 | `5` | Safety blocked a high-risk command or risk-increasing correction |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-8 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-9 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.
