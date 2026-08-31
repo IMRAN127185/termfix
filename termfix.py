@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-9: proof-backed correction and a portable terminal assistant.
+"""TermFix Steps 2-10: proof-backed correction and a portable terminal assistant.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
@@ -10,6 +10,7 @@ Language context and code symbols are inferred from bounded, local evidence only
 source files are inspected but never executed or modified.
 The interactive prompt retains these guarantees while accepting repeated commands.
 Portable builds are deterministic, and environment diagnostics remain read-only.
+Safe demo and acceptance modes exercise the backend without launching user commands.
 """
 
 from __future__ import annotations
@@ -32,13 +33,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import zipfile
 
 
 APP_NAME = "TermFix"
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -543,6 +545,39 @@ class DoctorCheck:
     status: DoctorStatus
     name: str
     detail: str
+
+
+@dataclass(frozen=True)
+class AcceptanceCaseResult:
+    """Observed outcome for one deterministic, non-executing acceptance case."""
+
+    name: str
+    category: str
+    passed: bool
+    supplied_input: str
+    expected: str
+    observed: str
+    showcase: bool = False
+
+
+@dataclass(frozen=True)
+class AcceptanceReport:
+    """Complete Step 10 evaluation report with observational runtime only."""
+
+    cases: tuple[AcceptanceCaseResult, ...]
+    elapsed_ms: float
+
+    @property
+    def passed(self) -> int:
+        return sum(case.passed for case in self.cases)
+
+    @property
+    def failed(self) -> int:
+        return len(self.cases) - self.passed
+
+    @property
+    def successful(self) -> bool:
+        return self.failed == 0
 
 
 def selected_environment(env: dict[str, str] | None) -> dict[str, str]:
@@ -4525,6 +4560,465 @@ def doctor_command(
     )
 
 
+def create_evaluation_executable(directory: Path, name: str) -> None:
+    """Create one inert PATH fixture that is discoverable but never executed."""
+
+    suffix = ".exe" if os.name == "nt" else ""
+    path = directory / f"{name}{suffix}"
+    path.write_bytes(b"")
+    if os.name != "nt":
+        path.chmod(0o755)
+
+
+def run_acceptance_evaluation() -> AcceptanceReport:
+    """Exercise real correction backends in isolated fixtures without execution."""
+
+    started = time.perf_counter()
+    results: list[AcceptanceCaseResult] = []
+
+    def add(
+        name: str,
+        category: str,
+        passed: bool,
+        supplied_input: str,
+        expected: str,
+        observed: str,
+        *,
+        showcase: bool = False,
+    ) -> None:
+        results.append(
+            AcceptanceCaseResult(
+                name=name,
+                category=category,
+                passed=bool(passed),
+                supplied_input=supplied_input,
+                expected=expected,
+                observed=observed,
+                showcase=showcase,
+            )
+        )
+
+    with tempfile.TemporaryDirectory(prefix="termfix-evaluation-") as folder:
+        root = Path(folder)
+        tools = root / "bin"
+        tools.mkdir()
+        create_evaluation_executable(tools, "python")
+        create_evaluation_executable(tools, "rm")
+        environment = {"PATH": str(tools)}
+        if os.name == "nt":
+            environment["PATHEXT"] = ".EXE;.CMD;.BAT;.COM"
+
+        (root / "main.py").write_text("print('demo')\n", encoding="utf-8")
+        (root / "file.txt").write_text("safe fixture\n", encoding="utf-8")
+        c_source = root / "main.c"
+        c_source.write_text(
+            "#include <stdio.h>\n"
+            "int calculate(int value) { return value + 1; }\n"
+            "int main(void) { printf(\"%d\\n\", calculate(1)); return 0; }\n",
+            encoding="utf-8",
+        )
+        original_c_source = c_source.read_bytes()
+
+        corrected = prepare_preflight(
+            ("pyhton", "mian.py"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        correction_observed = display_argv(corrected.suggested_argv)
+        add(
+            "Executable and file correction",
+            "Correction",
+            corrected.suggested_argv == ("python", "main.py")
+            and corrected.correction_count == 2
+            and not corrected.risk_increased,
+            "pyhton mian.py",
+            "python main.py with two locally proven corrections",
+            f"{correction_observed}; {corrected.correction_count} corrections",
+            showcase=True,
+        )
+
+        source_directory = root / "source"
+        source_directory.mkdir()
+        (source_directory / "main.py").write_text("print('nested')\n", encoding="utf-8")
+        directory_correction = prepare_preflight(
+            ("python", "soruce/main.py"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Directory component correction",
+            "Correction",
+            directory_correction.suggested_argv == ("python", "source/main.py")
+            and len(directory_correction.path_corrections) == 1,
+            "python soruce/main.py",
+            "python source/main.py from a locally proven directory",
+            display_argv(directory_correction.suggested_argv),
+            showcase=True,
+        )
+
+        unchanged = prepare_preflight(
+            ("python", "main.py"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Correct command remains unchanged",
+            "False-positive control",
+            not unchanged.has_correction and not unchanged.unresolved_paths,
+            "python main.py",
+            "no correction",
+            "unchanged" if not unchanged.has_correction else display_argv(unchanged.suggested_argv),
+        )
+
+        unrelated = prepare_preflight(
+            ("completely_unrelated_tool",),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Weak executable match is rejected",
+            "False-positive control",
+            unrelated.executable_correction is None,
+            "completely_unrelated_tool",
+            "no invented suggestion",
+            "no suggestion" if unrelated.executable_correction is None else unrelated.suggested_argv[0],
+        )
+
+        missing_path = prepare_preflight(
+            ("python", "file_that_does_not_exist.py"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Unavailable path is not invented",
+            "False-positive control",
+            not missing_path.has_correction
+            and missing_path.unresolved_paths == ((1, "file_that_does_not_exist.py"),),
+            "python file_that_does_not_exist.py",
+            "report unresolved path without guessing",
+            "unresolved; no suggestion" if missing_path.unresolved_paths else "unexpectedly accepted",
+        )
+
+        error_analysis = analyze_error_message(
+            "argument action: invalid choice: 'instal' (choose from 'install', 'remove')",
+            ("tool", "instal"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Explicit stderr choice correction",
+            "Error evidence",
+            error_analysis.category is ErrorCategory.INVALID_CHOICE
+            and error_analysis.suggestion == "install"
+            and error_analysis.token_index == 1,
+            "tool instal + explicit allowed choices",
+            "instal -> install from stderr evidence",
+            (
+                f"{error_analysis.extracted_token} -> {error_analysis.suggestion}"
+                if error_analysis.suggestion
+                else "no suggestion"
+            ),
+            showcase=True,
+        )
+
+        destructive = assess_command_safety(("rm", "-rf", "/"))
+        add(
+            "Destructive command is blocked",
+            "Safety",
+            destructive.level is RiskLevel.HIGH and destructive.blocked,
+            "rm -rf /",
+            "High risk and blocked",
+            f"{destructive.level.value} risk; {'blocked' if destructive.blocked else 'allowed'}",
+            showcase=True,
+        )
+
+        risk_increase = prepare_preflight(
+            ("rmm", "file.txt"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Risk-increasing correction is withheld",
+            "Safety",
+            risk_increase.suggested_argv[0] == "rm" and risk_increase.risk_increased,
+            "rmm file.txt",
+            "detect rm but withhold runnable correction",
+            (
+                "risk increased; correction withheld"
+                if risk_increase.risk_increased
+                else "risk increase was not detected"
+            ),
+        )
+
+        compound = assess_command_safety(("python", "main.py", "|", "more"))
+        compound_rules = {finding.rule for finding in compound.findings}
+        compound_blockers = execution_blocking_findings(compound)
+        blocker_rules = {finding.rule for finding in compound_blockers}
+        add(
+            "Shell operator is blocked",
+            "Safety",
+            "compound-shell-syntax" in compound_rules
+            and "compound-shell-syntax" in blocker_rules,
+            "python main.py | more",
+            "block shell syntax",
+            (
+                f"{compound.level.value} risk; execution blocked by: "
+                f"{', '.join(sorted(blocker_rules))}"
+            ),
+        )
+
+        understanding = understand_language_context(("gcc", "main.c"), cwd=root)
+        local_correction = find_identifier_correction("calcluate", understanding)
+        add(
+            "Local C function correction",
+            "Language",
+            understanding.context.language is SourceLanguage.C
+            and local_correction is not None
+            and local_correction.suggested == "calculate"
+            and local_correction.kind is SymbolKind.LOCAL_FUNCTION,
+            "calcluate in gcc main.c",
+            "calcluate -> calculate from the named source file",
+            (
+                f"calcluate -> {local_correction.suggested} ({local_correction.kind.value})"
+                if local_correction
+                else "no suggestion"
+            ),
+            showcase=True,
+        )
+
+        keyword_symbol = classify_identifier("while", understanding)
+        add(
+            "C keyword classification",
+            "Language",
+            keyword_symbol.kind is SymbolKind.KEYWORD,
+            "while in C context",
+            "C keyword",
+            keyword_symbol.kind.value,
+        )
+
+        library_symbol = classify_identifier("printf", understanding)
+        add(
+            "C standard-library classification",
+            "Language",
+            library_symbol.kind is SymbolKind.STANDARD_LIBRARY,
+            "printf in C context",
+            "C standard-library function",
+            library_symbol.kind.value,
+        )
+
+        add(
+            "Source remains byte-for-byte unchanged",
+            "Non-mutation",
+            c_source.read_bytes() == original_c_source,
+            "inspect main.c",
+            "no source edit",
+            "unchanged" if c_source.read_bytes() == original_c_source else "modified",
+        )
+
+        class EncodingProbe:
+            def __init__(self, encoding: str) -> None:
+                self.encoding = encoding
+
+        unicode_indicator = information_indicator(EncodingProbe("utf-8"))
+        ascii_indicator = information_indicator(EncodingProbe("ascii"))
+        add(
+            "Information indicator fallback",
+            "Interface",
+            unicode_indicator == "ⓘ" and ascii_indicator == "[i]",
+            "Unicode and ASCII-only terminal encodings",
+            "ⓘ with [i] fallback",
+            f"{unicode_indicator} / {ascii_indicator}",
+        )
+
+        interactive_output = io.StringIO()
+        interactive_errors = io.StringIO()
+        interactive_inputs = iter(("cd source", "pwd", "help", "exit"))
+
+        def evaluation_input(_prompt: str) -> str:
+            return next(interactive_inputs)
+
+        def forbidden_runner(*_args, **_kwargs):
+            raise AssertionError("interactive acceptance case attempted execution")
+
+        interactive_code = interactive_shell(
+            cwd=root,
+            input_fn=evaluation_input,
+            runner=forbidden_runner,
+            output=interactive_output,
+            error_output=interactive_errors,
+        )
+        interactive_text = interactive_output.getvalue()
+        add(
+            "Interactive built-ins stay internal",
+            "Interface",
+            interactive_code == EXIT_OK
+            and str(source_directory.resolve()) in interactive_text
+            and "TermFix interactive commands:" in interactive_text
+            and "Leaving TermFix." in interactive_text
+            and not interactive_errors.getvalue(),
+            "cd source, pwd, help, exit",
+            "internal commands work without launching a process",
+            "completed internally" if interactive_code == EXIT_OK else f"exit {interactive_code}",
+            showcase=True,
+        )
+
+        corrupt_directory = root / "corrupt-build"
+        corrupt_directory.mkdir()
+        corrupt_archive = corrupt_directory / PORTABLE_ARCHIVE_NAME
+        corrupt_manifest = corrupt_directory / BUILD_MANIFEST_NAME
+        corrupt_archive.write_bytes(b"not a Python ZIP application")
+        corrupt_manifest.write_text("{}\n", encoding="utf-8")
+        corrupt_checks, _manifest, _source = portable_artifact_checks(
+            corrupt_archive,
+            corrupt_manifest,
+            expected_source_hash=None,
+        )
+        corrupt_failed = any(check.status is DoctorStatus.FAIL for check in corrupt_checks)
+        add(
+            "Corrupted portable evidence is rejected",
+            "Artifact validation",
+            corrupt_failed,
+            "invalid archive and manifest",
+            "diagnostic failure without loading the application",
+            "rejected" if corrupt_failed else "unexpectedly accepted",
+        )
+
+        secret = "evaluation-secret-value"
+        sanitized = sanitized_argv(("tool", "--token", secret))
+        sanitized_display = display_argv(sanitized)
+        add(
+            "Credential value is redacted",
+            "Privacy",
+            secret not in sanitized_display and "<redacted>" in sanitized_display,
+            "tool --token <secret>",
+            "secret hidden",
+            sanitized_display,
+            showcase=True,
+        )
+
+        repeated = prepare_preflight(
+            ("pyhton", "mian.py"),
+            env=environment,
+            windows=os.name == "nt",
+            cwd=root,
+        )
+        add(
+            "Repeated analysis is deterministic",
+            "Determinism",
+            repeated.suggested_argv == corrected.suggested_argv
+            and repeated.executable_correction == corrected.executable_correction
+            and repeated.path_corrections == corrected.path_corrections
+            and repeated.suggested_safety == corrected.suggested_safety,
+            "analyze pyhton mian.py twice",
+            "identical structured result",
+            "identical" if repeated.suggested_argv == corrected.suggested_argv else "different",
+        )
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return AcceptanceReport(tuple(results), elapsed_ms)
+
+
+def render_acceptance_evaluation(report: AcceptanceReport) -> str:
+    """Render the compact pass/fail report used by developers and judges."""
+
+    lines = ["TermFix Acceptance Evaluation", ""]
+    for case in report.cases:
+        status = "PASS" if case.passed else "FAIL"
+        lines.append(f"[{status}] {case.category}: {case.name}")
+        if not case.passed:
+            lines.append(f"  Expected: {case.expected}")
+            lines.append(f"  Observed: {case.observed}")
+    lines.extend(
+        (
+            "",
+            f"Result: {report.passed}/{len(report.cases)} acceptance cases passed",
+            f"Runtime: {report.elapsed_ms:.2f} ms (observational, not a pass criterion)",
+            "No user command was executed, no project file was changed, and no internet was used.",
+            "Temporary isolated fixtures were deleted automatically.",
+        )
+    )
+    return "\n".join(lines)
+
+
+def render_safe_demo(report: AcceptanceReport, *, indicator: str) -> str:
+    """Render selected acceptance cases as a concise user-facing demonstration."""
+
+    showcased = tuple(case for case in report.cases if case.showcase)
+    lines = ["TermFix Safe Demo", ""]
+    for index, case in enumerate(showcased, start=1):
+        lines.extend(
+            (
+                f"Scenario {index}: {case.name}",
+                f"  Input: {case.supplied_input}",
+                f"  Expected: {case.expected}",
+                f"  Observed: {case.observed}  {indicator}",
+                f"  Status: {'PASS' if case.passed else 'FAIL'}",
+                "",
+            )
+        )
+    lines.extend(
+        (
+            f"Demo result: {sum(case.passed for case in showcased)}/{len(showcased)} scenarios passed",
+            "The same backend was used for the full acceptance evaluation.",
+            "Nothing was executed or edited; temporary fixtures were removed.",
+        )
+    )
+    return "\n".join(lines)
+
+
+def evaluation_command(
+    *,
+    evaluator: object | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Run deterministic Step 10 acceptance cases without launching commands."""
+
+    active_evaluator = run_acceptance_evaluation if evaluator is None else evaluator
+    try:
+        report = active_evaluator()
+    except (OSError, ValueError) as error:
+        print(f"Evaluation could not run: {error}", file=error_output)
+        return EXIT_NOT_FOUND
+    if not isinstance(report, AcceptanceReport):
+        print("Evaluation could not run: evaluator returned invalid data", file=error_output)
+        return EXIT_NOT_FOUND
+    print(render_acceptance_evaluation(report), file=output)
+    return EXIT_OK if report.successful else EXIT_NOT_FOUND
+
+
+def demo_command(
+    *,
+    evaluator: object | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Show representative TermFix behavior without executing user commands."""
+
+    active_evaluator = run_acceptance_evaluation if evaluator is None else evaluator
+    try:
+        report = active_evaluator()
+    except (OSError, ValueError) as error:
+        print(f"Demo could not run: {error}", file=error_output)
+        return EXIT_NOT_FOUND
+    if not isinstance(report, AcceptanceReport):
+        print("Demo could not run: evaluator returned invalid data", file=error_output)
+        return EXIT_NOT_FOUND
+    print(
+        render_safe_demo(report, indicator=information_indicator(output)),
+        file=output,
+    )
+    showcased = tuple(case for case in report.cases if case.showcase)
+    return EXIT_OK if showcased and all(case.passed for case in showcased) else EXIT_NOT_FOUND
+
+
 def split_windows_interactive_command(line: str) -> tuple[str, ...]:
     """Split a Windows-style line while preserving ordinary path backslashes."""
 
@@ -4892,6 +5386,14 @@ def make_parser() -> argparse.ArgumentParser:
         "doctor",
         help="inspect local runtime and build evidence without changing anything",
     )
+    actions.add_parser(
+        "demo",
+        help="show representative TermFix behavior without running user commands",
+    )
+    actions.add_parser(
+        "evaluate",
+        help="run the deterministic, non-executing acceptance evaluation",
+    )
 
     actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
@@ -4934,6 +5436,10 @@ def cli(argv: list[str] | None = None) -> int:
         return build_command()
     if args.action == "doctor":
         return doctor_command()
+    if args.action == "demo":
+        return demo_command()
+    if args.action == "evaluate":
+        return evaluation_command()
     return EXIT_USAGE
 
 
@@ -7434,6 +7940,137 @@ class TermFixTests(unittest.TestCase):
 
             self.assertEqual(code, EXIT_NOT_FOUND)
             self.assertIn("dependency evidence does not match", output.getvalue())
+
+    def test_acceptance_evaluation_passes_all_bounded_scenarios(self) -> None:
+        with mock.patch(
+            __name__ + ".subprocess.run",
+            side_effect=AssertionError("evaluation must not launch subprocesses"),
+        ), mock.patch(
+            __name__ + ".execute_command",
+            side_effect=AssertionError("evaluation must not execute commands"),
+        ):
+            report = run_acceptance_evaluation()
+
+        self.assertTrue(report.successful)
+        self.assertEqual(report.passed, 18)
+        self.assertEqual(report.failed, 0)
+        self.assertGreaterEqual(report.elapsed_ms, 0)
+        self.assertEqual(
+            {case.category for case in report.cases},
+            {
+                "Correction",
+                "False-positive control",
+                "Error evidence",
+                "Safety",
+                "Language",
+                "Non-mutation",
+                "Privacy",
+                "Determinism",
+                "Interface",
+                "Artifact validation",
+            },
+        )
+
+    def test_acceptance_evaluation_is_structurally_deterministic(self) -> None:
+        first = run_acceptance_evaluation()
+        second = run_acceptance_evaluation()
+
+        self.assertEqual(first.cases, second.cases)
+        self.assertGreaterEqual(first.elapsed_ms, 0)
+        self.assertGreaterEqual(second.elapsed_ms, 0)
+
+    def test_acceptance_renderers_do_not_leak_fixture_paths_or_secret(self) -> None:
+        report = run_acceptance_evaluation()
+        rendered_evaluation = render_acceptance_evaluation(report)
+        rendered_demo = render_safe_demo(report, indicator="[i]")
+
+        for rendered in (rendered_evaluation, rendered_demo):
+            self.assertNotIn("termfix-evaluation-", rendered)
+            self.assertNotIn("evaluation-secret-value", rendered)
+        self.assertIn("18/18 acceptance cases passed", rendered_evaluation)
+        self.assertIn("7/7 scenarios passed", rendered_demo)
+        self.assertIn("[i]", rendered_demo)
+
+    def test_evaluation_command_reports_success_and_non_execution_guarantee(self) -> None:
+        output = self._output()
+        code = evaluation_command(output=output, error_output=self._output())
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("TermFix Acceptance Evaluation", output.getvalue())
+        self.assertIn("No user command was executed", output.getvalue())
+        self.assertIn("Temporary isolated fixtures were deleted", output.getvalue())
+
+    def test_demo_command_shows_only_showcase_scenarios(self) -> None:
+        output = self._output()
+        code = demo_command(output=output, error_output=self._output())
+
+        self.assertEqual(code, EXIT_OK)
+        rendered = output.getvalue()
+        self.assertIn("TermFix Safe Demo", rendered)
+        self.assertEqual(rendered.count("Scenario "), 7)
+        self.assertIn("pyhton mian.py", rendered)
+        self.assertIn("rm -rf /", rendered)
+        self.assertIn("calcluate -> calculate", rendered)
+        self.assertIn("Nothing was executed or edited", rendered)
+
+    def test_evaluation_and_demo_return_failure_for_failed_cases(self) -> None:
+        failed = AcceptanceCaseResult(
+            name="simulated failure",
+            category="Test",
+            passed=False,
+            supplied_input="input",
+            expected="expected",
+            observed="observed",
+            showcase=True,
+        )
+        report = AcceptanceReport((failed,), 1.0)
+        evaluation_output = self._output()
+        demo_output = self._output()
+
+        evaluation_code = evaluation_command(
+            evaluator=lambda: report,
+            output=evaluation_output,
+            error_output=self._output(),
+        )
+        demo_code = demo_command(
+            evaluator=lambda: report,
+            output=demo_output,
+            error_output=self._output(),
+        )
+
+        self.assertEqual(evaluation_code, EXIT_NOT_FOUND)
+        self.assertEqual(demo_code, EXIT_NOT_FOUND)
+        self.assertIn("[FAIL]", evaluation_output.getvalue())
+        self.assertIn("Status: FAIL", demo_output.getvalue())
+
+    def test_evaluation_commands_reject_invalid_evaluator_data(self) -> None:
+        errors = self._output()
+        evaluation_code = evaluation_command(
+            evaluator=lambda: object(),
+            output=self._output(),
+            error_output=errors,
+        )
+        demo_code = demo_command(
+            evaluator=lambda: object(),
+            output=self._output(),
+            error_output=errors,
+        )
+
+        self.assertEqual(evaluation_code, EXIT_NOT_FOUND)
+        self.assertEqual(demo_code, EXIT_NOT_FOUND)
+        self.assertEqual(errors.getvalue().count("returned invalid data"), 2)
+
+    def test_cli_routes_demo_and_evaluate_actions(self) -> None:
+        with mock.patch(__name__ + ".demo_command", return_value=EXIT_OK) as demo:
+            self.assertEqual(cli(["demo"]), EXIT_OK)
+        with mock.patch(
+            __name__ + ".evaluation_command",
+            return_value=EXIT_OK,
+        ) as evaluation:
+            self.assertEqual(cli(["evaluate"]), EXIT_OK)
+
+        demo.assert_called_once_with()
+        evaluation.assert_called_once_with()
 
     @staticmethod
     def _output():

@@ -12,6 +12,7 @@ The repository currently contains:
 - **Step 7:** detect the active source language and classify keywords, standard-library names and project-local declarations.
 - **Step 8:** provide a continuous `termfix>` terminal with safe built-ins and the complete correction pipeline.
 - **Step 9:** test and package TermFix reproducibly, then diagnose its local environment without changing it.
+- **Step 10:** demonstrate the real backend safely and measure it against deterministic acceptance cases.
 
 Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
 
@@ -139,6 +140,24 @@ python -I -S dist/termfix.pyz doctor
 
 `doctor` is strictly read-only. It does not execute the archived program, run tests, install anything, edit `PATH`, modify shell profiles or write files. A missing portable build is a warning; corrupted, modified or stale build evidence is a failure.
 
+## Safe demo and acceptance evaluation
+
+Show seven representative TermFix scenarios:
+
+```powershell
+python -I -S termfix.py demo
+```
+
+Run the complete Step 10 acceptance evaluation:
+
+```powershell
+python -I -S termfix.py evaluate
+```
+
+The evaluation currently checks 18 cases covering executable, file and directory correction; false-positive refusal; stderr evidence; destructive-command and shell-operator blocking; language-aware symbol understanding; non-mutation; indicator fallback; internal interactive commands; corrupt-artifact rejection; credential redaction; and deterministic repeated analysis. It also reports observational runtime, but speed is not used as a pass condition.
+
+These commands are optional and intended for development, judging and demonstration. A normal user starts TermFix with `python termfix.py shell`. Neither `demo` nor `evaluate` launches a user command, edits project files, accesses the internet or scans the computer. They create only small isolated fixtures in the operating system's temporary directory and delete them automatically.
+
 ## Current guarantees
 
 - Standard library only; `requirements.txt` is empty.
@@ -176,25 +195,29 @@ python -I -S dist/termfix.pyz doctor
 - Existing incomplete, unknown, symlinked or manually modified build output is never overwritten.
 - Build files are staged and replaced atomically; an archive replacement is rolled back if the manifest replacement fails.
 - `doctor` validates local evidence without executing subprocesses or modifying the filesystem.
+- `demo` shows seven user-facing scenarios through the real correction, safety and language backends.
+- `evaluate` runs 18 explicit acceptance cases, including false-positive and non-mutation controls.
+- Step 10 never launches a user command; its isolated temporary fixtures are removed automatically.
+- Acceptance output never exposes its temporary path or test credential value.
 - Weak matches are rejected.
 - Tokens that do not require correction stay unchanged.
 - Candidate ranking is deterministic.
 - `check`, `safety` and `context` cannot call the executor.
 
-Only the explicit `run` action, external commands entered inside `shell`, and the isolated self-test started by `build` can launch a child process. The `check`, `safety`, `context` and `doctor` actions remain read-only. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all command execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added. `build` creates only the `dist` directory and its two declared files; it never installs TermFix or changes system configuration.
+Only the explicit `run` action, external commands entered inside `shell`, and the isolated self-test started by `build` can launch a child process. The `check`, `safety`, `context` and `doctor` actions remain read-only. `demo` and `evaluate` do not launch commands or change project files, but they briefly create and remove isolated temporary fixtures. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all command execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added. `build` creates only the `dist` directory and its two declared files; it never installs TermFix or changes system configuration.
 
 ## Exit codes
 
 | Code | Meaning |
 |---:|---|
 | `0` | Successful read-only check/classification; no correction required |
-| `1` | Wrapped command failed, launch failed, no reliable correction was found, or `doctor` found invalid evidence |
+| `1` | Wrapped command failed, launch failed, no reliable correction was found, diagnostics found invalid evidence, or an acceptance/demo case failed |
 | `2` | Invalid CLI usage |
 | `3` | Reliable correction available |
 | `4` | User cancelled or interrupted the operation |
 | `5` | Safety blocked a high-risk command or risk-increasing correction |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-9 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-10 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.
