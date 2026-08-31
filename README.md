@@ -1,138 +1,148 @@
 # TermFix
 
-TermFix is a zero-dependency Python CLI for proof-backed terminal command correction.
+> An offline, zero-dependency terminal assistant that corrects command mistakes using local evidence and never runs a correction without permission.
 
-The repository currently contains:
+- **Track:** A — Developer Tools & CLI
+- **Runtime:** Python standard library only
+- **Version:** 0.13.0
+- **License:** MIT
 
-- **Step 2:** correct the executable token using real commands discovered on `PATH`.
-- **Step 3:** correct file and directory arguments using real entries from the relevant local directory.
-- **Step 4:** recognize useful stderr patterns and derive corrections from explicit program evidence.
-- **Step 5:** classify command risk with deterministic rules before any future execution is considered.
-- **Step 6:** run approved commands with `shell=False`, capture failures and offer one safe corrected retry.
-- **Step 7:** detect the active source language and classify keywords, standard-library names and project-local declarations.
-- **Step 8:** provide a continuous `termfix>` terminal with safe built-ins and the complete correction pipeline.
-- **Step 9:** test and package TermFix reproducibly, then diagnose its local environment without changing it.
-- **Step 10:** demonstrate the real backend safely and measure it against deterministic acceptance cases.
-- **Step 11:** generate a safe, current-session PowerShell launcher for a verified portable build.
-- **Step 12:** correct strong Python interpreter-option typos and add accessible, optional terminal color.
-- **Step 13:** collect, analyze and individually review bounded multiline command pastes without accidental execution.
-- **Step 14:** locate the project automatically, build and diagnose it, then open the interactive terminal with one command.
+## The problem
 
-Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
+Terminal mistakes are easy to make and often difficult to understand. A misspelled executable, filename, option or project function can produce an unclear error, while blindly correcting a destructive command can make the situation worse.
 
-## One-command startup
+Editors provide spelling suggestions and explanations, but a normal terminal usually waits until after Enter is pressed to report a failure.
 
-Run the complete development startup sequence with one command:
+## The solution
 
-```powershell
-python termfix.py start
-```
+TermFix provides an interactive `termfix>` terminal that examines a command before execution. It can:
 
-It automatically uses the folder containing `termfix.py`, runs the isolated tests and deterministic build, runs Doctor, and opens `termfix>` in that project folder. If the build or Doctor fails, startup stops and the interactive terminal is not opened.
+- correct executable names using programs proven to exist on `PATH`;
+- correct file and directory arguments using entries proven to exist locally;
+- recognize selected Python option mistakes such as `vrsion → --version`;
+- understand keywords, standard-library names and declared functions in named source files;
+- classify command risk before execution;
+- explain what changed and why; and
+- require explicit approval before running any corrected command.
 
-It also works from another PowerShell directory when the script path is supplied:
+TermFix works offline, installs no packages, does not send commands to an API and does not silently edit source files.
 
-```powershell
-python "D:\Zero Dependency Hackathon\termfix.py" start
-```
+## Thirty-second demonstration
 
-The TermFix session starts in `D:\Zero Dependency Hackathon`; after `exit`, the parent PowerShell window remains in its original directory because a child program cannot permanently change its parent shell's directory.
-
-## Try it
-
-```powershell
-python termfix.py check -- pyhton app.py
-```
-
-Correct a misspelled local path:
-
-```powershell
-python termfix.py check -- python src/mian.py --verbose
-```
-
-Analyze a supplied error message without running the command:
-
-```powershell
-python termfix.py check --error-text "argument action: invalid choice: 'instal' (choose from 'install', 'remove')" -- tool instal
-```
-
-Classify a command without running it:
-
-```powershell
-python termfix.py safety -- git reset --hard
-```
-
-Run a valid command through the guarded executor:
-
-```powershell
-python termfix.py run -- python --version
-```
-
-Try a corrected run in an interactive terminal:
-
-```powershell
-python termfix.py run -- pyhton --version
-```
-
-Correct a misspelled executable and a misspelled Python information option together:
-
-```powershell
-python termfix.py run -- pythod vrsion
-```
-
-TermFix proposes `python --version`. The executable is proven from `PATH`; `--version` is proven by a small built-in Python option profile. The corrected command still requires `y` approval and runs with `shell=False`. A real local file or a stronger local path match takes priority, and unrelated program arguments, `-m` module names and `-c` code are left unchanged.
-
-Inspect language context and check a possible code identifier without compiling or running it:
-
-```powershell
-python termfix.py context --identifier calcluate -- gcc main.c
-```
-
-If `main.c` declares a function named `calculate`, TermFix reports C as the language and suggests `calcluate -> calculate` with the file and line as evidence. It can also distinguish a C keyword such as `while` from a C standard-library function such as `printf`.
-
-The same backend runs after a failed `run`: recognized undeclared-name errors from Python, JavaScript, Java, C and C++ are checked against the active profile and named source files. A source-backed suggestion is displayed, but TermFix never edits the source automatically.
-
-When automatic evidence is unavailable, provide an explicit language override:
-
-```powershell
-python termfix.py context --language cpp --identifier whlie -- custom-tool source.unknown
-```
-
-Deep symbol profiles are included for Python, JavaScript, Java, C and C++. TermFix can detect additional languages—including TypeScript, C#, Go, Rust, Ruby, PHP, Kotlin, Swift, Dart, Lua, Perl, R, Julia, shell and PowerShell—but does not claim deep parsing for them yet.
-
-Start the interactive TermFix terminal once and enter multiple commands:
-
-```powershell
-python termfix.py shell
-```
+Start TermFix and enter a command containing two mistakes:
 
 ```text
-termfix> pyhton mian.py
+termfix> pythod vrsion
 
 Original:
-  pyhton mian.py
+  pythod vrsion
 
 Suggestion:
-  python main.py  ⓘ
+  python --version  ⓘ
 
 [y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel
 ```
 
-The interactive terminal includes `cd PATH`, `pwd`, `clear`, `paste`, `help` and `exit`. Its current directory is session-local, and a misspelled `cd` directory can receive the same evidence-backed correction and approval flow. Outside paste collection, `Ctrl+C` cancels the current input or interrupts a command without closing TermFix; `Ctrl+D`/EOF exits cleanly. Use `python termfix.py shell --cwd DIRECTORY` to choose the starting directory.
+TermFix proves that `python` exists on the local `PATH`, recognizes `--version` from its bounded Python option profile, and waits for the user. Selecting Explain or Diff shows the evidence without executing anything.
 
-Color makes changed tokens and risk labels easier to scan. It is optional and never carries meaning by itself:
+A destructive command is handled differently:
 
-```powershell
-python termfix.py shell --color auto
-python termfix.py shell --color always
-python termfix.py shell --color never
+```text
+termfix> rm -rf /
+
+Risk: High
+Status: BLOCKED
 ```
 
-`auto` is the default and styles only an interactive terminal. Redirected output, `TERM=dumb`, `--color never`, and the `NO_COLOR` environment variable produce plain text. The same option is available on `check`, `safety`, and `run`. The words, labels, `ⓘ`/`[i]` indicator and approval choices remain present without color.
+The command is not offered a working Run action.
 
-### Safe multiline paste mode
+## Why TermFix is different
 
-Enter `paste` at `termfix>` before pasting several commands:
+| Capability | TermFix approach |
+|---|---|
+| Correction evidence | Real executables, local paths, recognized errors and explicitly named source files |
+| False-positive control | Weak or conflicting matches are rejected instead of guessed |
+| Source awareness | Recognizes language vocabulary and project-local declarations without running the source |
+| Safety | Rechecks risk after correction and blocks corrections that increase risk |
+| Execution | Uses an argument vector with `shell=False`; corrected commands need explicit approval |
+| Privacy | Entirely local and offline, with obvious credential values redacted from diagnostics |
+| Dependencies | Python standard library only; `requirements.txt` is exactly empty |
+
+## Quick start
+
+Requirements:
+
+- Python 3.13 or newer;
+- no package installation; and
+- a local clone of this repository.
+
+Clone and enter the repository:
+
+```powershell
+git clone https://github.com/IMRAN127185/termfix.git
+cd termfix
+```
+
+For the complete verified startup, run one command:
+
+```powershell
+python -I -S termfix.py start
+```
+
+`start` locates the project directory, runs the complete isolated test suite, creates the deterministic portable build, runs Doctor and opens `termfix>`. If the build or Doctor fails, the interactive terminal is not opened.
+
+To start immediately without rebuilding:
+
+```powershell
+python -I -S termfix.py shell
+```
+
+From another directory, provide the source path once:
+
+```powershell
+python -I -S "C:\path\to\termfix\termfix.py" start
+```
+
+The TermFix session starts in the project directory. Exiting it does not change the parent PowerShell directory because a child process cannot permanently change its parent shell.
+
+## Main features
+
+### Evidence-backed correction
+
+TermFix does not use an online language model or a global computer scan. Each runnable correction must have bounded local evidence:
+
+- executable → a real `PATH` entry;
+- file or directory → a real neighboring entry;
+- program option → a strong match from a small built-in profile;
+- error correction → a recognized error pattern with an explicit candidate; or
+- code identifier → active-language vocabulary or a declaration in an explicitly named source file.
+
+### Source-aware diagnostics
+
+Deep symbol profiles are available for Python, JavaScript, Java, C and C++. For example, when `main.c` declares `calculate`, TermFix can distinguish:
+
+```text
+while       → C keyword
+printf      → C standard-library function
+calculate   → Function declared in main.c
+calcluate   → Possible typo of the local function calculate
+```
+
+Additional languages can be detected conservatively, including TypeScript, C#, Go, Rust, Ruby, PHP, Kotlin, Swift, Dart, Lua, Perl, R, Julia, shell and PowerShell. TermFix does not claim deep parsing for these additional languages.
+
+### Interactive explanations
+
+For a correction, the user can choose:
+
+```text
+[y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel
+```
+
+`ⓘ` is displayed when supported, with `[i]` as the ASCII fallback. Optional ANSI color improves scanning but never carries meaning by itself.
+
+### Safe multiline paste review
+
+Type `paste` before entering several independent commands:
 
 ```text
 termfix> paste
@@ -142,194 +152,102 @@ paste[3]> rm -rf /
 paste[4]> .end
 ```
 
-Paste mode accepts one complete command per line. `.end` ends collection. It then parses and analyzes every line separately, displays numbered `READY`, `CORRECTED`, `BLOCKED`, `UNAVAILABLE` or `INVALID` results, and executes nothing.
+TermFix analyzes every line before review, displays a status for each one and executes nothing automatically. A new unpredictable review code prevents already-buffered pasted text from becoming approval input. Every line is reviewed individually; there is no Run-all shortcut.
 
-After analysis, TermFix generates a new unpredictable code such as:
-
-```text
-REVIEW-7A4F31C829D0B615
-```
-
-The user must manually type that exact code before per-line decisions are enabled. Text that was already buffered by the original paste is ignored while this review lock remains active, so another pasted command cannot accidentally become Run approval. Each line then offers `Run`, `Skip`, `Explain` and `Diff`; blocked, invalid and unavailable lines have no working Run action. Every selected command is analyzed again immediately before execution, and every child process still receives an argument list with `shell=False`.
-
-Collection is limited to 20 nonblank commands, 4,096 characters per line and 32,768 characters total. Exceeding a limit, sending an embedded line break through one input event, or interrupting collection closes the TermFix shell so leftover buffered input cannot fall back into the normal prompt. Interactive built-ins such as `cd` and `exit` must be entered individually outside paste mode. Step 13 handles several separate one-line commands; it deliberately does not interpret PowerShell/Bash continuations, heredocs, pipelines or multiline scripts.
-
-TermFix displays the suggestion and waits for one of these choices:
+## How it works
 
 ```text
-[y] Run   [e] Explain   [d] Diff   [Enter/n] Cancel
+User command
+     ↓
+Parse into an argument vector
+     ↓
+Discover PATH, local path, error and language evidence
+     ↓
+Generate only strong, locally provable corrections
+     ↓
+Classify the original and corrected command risk
+     ↓
+Show suggestion, evidence and diff
+     ↓
+Explicit approval → revalidate → execute with shell=False
 ```
 
-Only `y` or `yes` approves a corrected command. Enter, `n`, EOF and non-interactive input cancel. `e` displays correction evidence and `d` displays the changed token positions. An unchanged command may run immediately because choosing the `run` action already expresses intent; all Step 5 execution blocks still apply.
+Corrections that become more dangerous are withheld. A selected pasted command is analyzed again immediately before execution so stale evidence cannot bypass review.
 
-Step 5 labels commands as:
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete deterministic pipeline.
 
-- **Low:** a recognized read-only form, such as `git status` or `python --version`.
-- **Medium:** an unknown command or one that may change state or execute code.
-- **High:** a recognized destructive operation, dangerous redirection, broad destructive target or raw device target.
+## Command reference
 
-High-risk results are marked `BLOCKED` and return exit code `5`. Unknown commands are never assumed to be Low risk. If a spelling correction would increase risk—for example, an unknown typo becoming a deletion command—TermFix withholds the runnable correction.
+| Command | Purpose |
+|---|---|
+| `python termfix.py start` | Build, diagnose and open the interactive terminal |
+| `python termfix.py shell` | Open the interactive terminal immediately |
+| `python termfix.py check -- COMMAND` | Inspect a command without executing it |
+| `python termfix.py safety -- COMMAND` | Explain the command’s risk classification |
+| `python termfix.py run -- COMMAND` | Preflight and guard execution |
+| `python termfix.py context --identifier NAME -- COMMAND` | Inspect language and symbol evidence |
+| `python termfix.py build` | Test and create a deterministic `.pyz` application |
+| `python termfix.py doctor` | Validate runtime, dependency and build evidence read-only |
+| `python termfix.py demo` | Show nine safe user-facing scenarios |
+| `python termfix.py evaluate` | Run 21 deterministic acceptance cases |
+| `python termfix.py self-test` | Run the embedded standard-library test suite |
 
-Run the embedded standard-library tests:
+Inside `termfix>`, the built-ins `cd`, `pwd`, `clear`, `paste`, `help` and `exit` run internally without launching a system shell.
+
+## Verification
+
+The current source is verified by:
+
+- **206/206 embedded tests passed** under `python -I -S`;
+- **21/21 acceptance cases passed**;
+- **9/9 demonstration scenarios passed**;
+- **23/23 direct imports identified as standard-library modules**;
+- an exactly empty `requirements.txt`;
+- source-mode and portable-archive Doctor checks; and
+- byte-for-byte reproducible portable builds.
+
+Run the evidence locally:
 
 ```powershell
 python -I -S termfix.py self-test
-```
-
-## Portable build and doctor
-
-Create a tested portable build:
-
-```powershell
-python -I -S termfix.py build
-```
-
-The build command first runs the complete embedded test suite in an isolated Python process. It writes exactly two persistent files inside `dist/` only after the tests pass:
-
-- `dist/termfix.pyz` — a portable Python ZIP application.
-- `dist/build-manifest.json` — hashes and dependency/test evidence for that archive.
-
-Run the portable application wherever a compatible Python interpreter is available:
-
-```powershell
-python -I -S dist/termfix.pyz shell
-```
-
-Inspect the current runtime, dependency proof, source, build hash, archive structure and recorded test result:
-
-```powershell
-python -I -S termfix.py doctor
-python -I -S dist/termfix.pyz doctor
-```
-
-`doctor` is strictly read-only. It does not execute the archived program, run tests, install anything, edit `PATH`, modify shell profiles or write files. A missing portable build is a warning; corrupted, modified or stale build evidence is a failure.
-
-## Safe demo and acceptance evaluation
-
-Show nine representative TermFix scenarios:
-
-```powershell
-python -I -S termfix.py demo
-```
-
-Run the complete Step 10 acceptance evaluation:
-
-```powershell
 python -I -S termfix.py evaluate
-```
-
-The evaluation currently checks 21 cases covering executable, file, directory and Python-option correction; false-positive refusal; stderr evidence; destructive-command and shell-operator blocking; language-aware symbol understanding; non-mutation; accessible color fallback; indicator fallback; internal interactive commands; safe paste collection and review locking; corrupt-artifact rejection; credential redaction; and deterministic repeated analysis. It also reports observational runtime, but speed is not used as a pass condition.
-
-These commands are optional and intended for development, judging and demonstration. A normal user can start TermFix directly with `python termfix.py shell`; a developer can use `python termfix.py start` to rebuild and diagnose it first. Neither `demo` nor `evaluate` launches a user command, edits project files, accesses the internet or scans the computer. They create only small isolated fixtures in the operating system's temporary directory and delete them automatically.
-
-## Current-session PowerShell activation
-
-Step 11 lets a PowerShell user type `termfix` without permanently installing anything. First create and verify the current portable build:
-
-```powershell
+python -I -S termfix.py demo
 python -I -S termfix.py build
 python -I -S termfix.py doctor
 ```
 
-Generate the activation block:
+The build writes only `dist/termfix.pyz` and `dist/build-manifest.json`. The manifest records hashes, standard-library import proof, empty-requirements proof and the passing test count without build times or machine-specific paths.
 
-```powershell
-python -I -S termfix.py activate --shell powershell
-```
+## Safety boundaries
 
-This command prints PowerShell code only. Review it, then copy the complete output and paste it into the same PowerShell window. Do not pipe it to `Invoke-Expression` or `iex`.
+- Corrected commands are never executed silently.
+- High-risk commands and risk-increasing corrections are blocked.
+- Child processes always receive an argument list with `shell=False`.
+- `check`, `safety`, `context`, `doctor` and `activate` are read-only.
+- Source inspection is bounded and never executes or edits source code.
+- Paste mode has count and size limits and requires individual review.
+- A Low label means conservative evidence was found; it is not a universal safety guarantee.
 
-After pasting it:
+See [SECURITY.md](SECURITY.md) for the complete threat model, controls and limitations.
 
-```powershell
-termfix                 # opens the interactive termfix> terminal
-termfix doctor          # forwards arguments safely
-termfix demo
-termfix evaluate
-termfix --version
-termfix-deactivate      # removes this session's TermFix launcher
-```
+## Current limitations
 
-Python cannot directly change the parent PowerShell process, so activation is deliberately a review-and-paste operation. The generated block refuses command-name collisions, creates read-only session aliases, sends arguments separately with `@args`, and records the archive SHA-256 as an ownership marker. Before every launch it checks that the recorded Python interpreter still exists and recomputes the archive hash; a moved or changed build is refused until it is rebuilt and reactivated. Deactivation checks the marker, both aliases and both internal functions before removing anything.
+- TermFix is an explicit interactive terminal; it does not watch ordinary PowerShell, CMD or Bash input automatically.
+- Paste mode accepts several independent one-line commands, not pipelines, heredocs, shell continuations or multiline scripts.
+- Shell aliases, redirection, pipelines and command chaining are unavailable inside `termfix>` because execution intentionally uses `shell=False`.
+- Deep source-symbol understanding is currently limited to Python, JavaScript, Java, C and C++.
+- Source parsing is conservative and is not a replacement for a compiler or full language server.
+- The exact competition target is Python 3.14.7; current local verification was performed with compatible Python 3.13.12 and should be repeated on 3.14.7 before submission.
+- `start` requires `termfix.py` because it creates a fresh build. The portable `dist/termfix.pyz` supports commands such as `shell` and `doctor`, but it does not rebuild itself.
 
-Activation requires a complete, current and unmodified `dist/termfix.pyz` plus its manifest. The generator is read-only: it does not start PowerShell, execute the generated block, write a launcher, edit `PATH` or `$PROFILE`, touch the registry, request administrator access, install packages or access the internet. Closing PowerShell also removes the session-only launcher. Step 11 intentionally supports PowerShell only; CMD and Bash require separate quoting and lifecycle designs.
+## Technical documentation
 
-## Current guarantees
+- [ARCHITECTURE.md](ARCHITECTURE.md) — correction algorithms, evidence ranking and execution flow.
+- [SECURITY.md](SECURITY.md) — threat model, risk rules, privacy and safety boundaries.
+- [DEVELOPMENT.md](DEVELOPMENT.md) — development history, builds, tests, activation and exit codes.
 
-- Standard library only; `requirements.txt` is empty.
-- Suggested executables are discovered locally on `PATH`.
-- Suggested files and directories are proven to exist locally.
-- Python information-option suggestions come from a versioned built-in profile and require a strong match.
-- Existing local files and equally strong local path corrections take priority over Python option meaning.
-- Arbitrary Python program arguments, `-m` modules and `-c` code are not changed by the option profile.
-- Path searching is limited to the relevant directory; the computer is not scanned globally.
-- At most one misspelled component is corrected in each path token.
-- URLs, options and wildcard expressions are not treated as paths.
-- Recognized errors include command-not-found, missing file/module, invalid choice, unrecognized argument and permission denied.
-- Explicit suggestions and allowed choices from stderr are treated as evidence, not instructions.
-- Raw stderr is not repeated in correction output, and obvious credential assignments are redacted.
-- Safety rules recognize deletion, formatting, shutdown/reboot, disk-management, destructive Git operations, force/recursive flags, shell operators, overwrite redirection and broad/device targets.
-- Every safety label includes the exact rules and evidence that produced it.
-- Corrections that would increase the conservative risk level are blocked.
-- Corrected execution always requires explicit `y` approval; Enter cancels.
-- Child processes receive an argument list and `shell=False` is always enforced.
-- High-risk operations, complex shell operators and explicit shell-command strings are blocked by `run`.
-- Failed commands may receive one stderr-backed corrected retry, which requires a new approval.
-- Language evidence can come from an explicit override, tool name, source extension, shebang, compiler/runtime error shape or direct project marker.
-- Conflicting strong language evidence produces `Unknown`; TermFix does not guess through a conflict.
-- Source inspection is limited to at most 16 explicitly named files of at most 1 MiB each.
-- Python declarations are read with the standard-library AST. JavaScript, Java, C and C++ declarations use conservative patterns after comments and strings are masked.
-- Identifier corrections come only from the active language profile or declarations proven in the explicitly named source files.
-- Recognized undeclared-identifier failures receive a compact source-backed diagnostic; source code is never silently changed.
-- Interactive input is split into an argument vector without opening PowerShell, CMD, Bash or another system shell.
-- The interactive prompt reuses executable, path, stderr, safety and language-aware correction for every external command.
-- Interactive `cd`, `pwd`, `clear`, `paste`, `help` and `exit` are internal operations and do not spawn shell commands.
-- The interactive directory exists only inside the TermFix session; the parent terminal directory is not changed.
-- Paste mode analyzes every collected line before review and never provides a Run-all shortcut.
-- A newly generated 64-bit review code prevents buffered pasted lines from becoming approvals.
-- Paste-mode commands require individual decisions and are revalidated before selected execution.
-- High-risk, invalid and unavailable paste lines cannot be run; size-limit failures close the shell safely.
-- Raw unparseable paste text is hidden so a malformed line cannot bypass credential redaction.
-- `ⓘ` is displayed when the terminal encoding supports it, with `[i]` as the safe fallback.
-- ANSI color is optional, TTY-aware and removable without losing any words, labels or controls; `NO_COLOR` is respected.
-- Invalid quotes, blank input, `Ctrl+C` and EOF are handled without a traceback.
-- A portable build is created only after the full test suite passes under `python -I -S` with `shell=False`.
-- The portable archive contains exactly one uncompressed `__main__.py` entry with normalized LF line endings and a fixed 1980 timestamp.
-- Rebuilding unchanged source produces byte-for-byte identical archive and manifest files.
-- The build manifest records SHA-256 hashes, standard-library import proof, empty-requirements proof and the passing test count without machine-specific paths or build times.
-- Existing incomplete, unknown, symlinked or manually modified build output is never overwritten.
-- Build files are staged and replaced atomically; an archive replacement is rolled back if the manifest replacement fails.
-- `doctor` validates local evidence without executing subprocesses or modifying the filesystem.
-- `demo` shows nine user-facing scenarios through the real correction, safety and language backends.
-- `evaluate` runs 21 explicit acceptance cases, including false-positive, semantic-profile, accessibility, paste-lock and non-mutation controls.
-- Step 10 never launches a user command; its isolated temporary fixtures are removed automatically.
-- Acceptance output never exposes its temporary path or test credential value.
-- PowerShell activation is generated only for a portable archive whose structure, source hash, dependency proof and test evidence all validate.
-- Activation paths reject control characters and use escaped single-quoted PowerShell literals.
-- The activation generator prints code but never invokes PowerShell or changes the current session itself.
-- Generated `termfix` and `termfix-deactivate` aliases are session-only, collision-aware and read-only.
-- Deactivation refuses to remove anything unless its hash marker, aliases and internal functions prove ownership.
-- Running `termfix` without arguments opens `shell`; supplied arguments are forwarded with PowerShell array expansion rather than command-string construction.
-- Every activated launch rechecks the archive SHA-256, so replacement after activation cannot run silently.
-- Weak matches are rejected.
-- Tokens that do not require correction stay unchanged.
-- Candidate ranking is deterministic.
-- `check`, `safety` and `context` cannot call the executor.
+## Competition compliance
 
-Only the explicit `run` action, external commands entered inside `shell`, and the isolated self-test started by `build` can launch a child process. The `check`, `safety`, `context`, `doctor` and `activate` actions remain read-only. `demo` and `evaluate` do not launch commands or change project files, but they briefly create and remove isolated temporary fixtures. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because all command execution enforces `shell=False`, PowerShell/CMD aliases and shell syntax such as pipelines, redirection and command chaining are not available inside `termfix>`. Use the provided internal built-ins or a real executable. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added. `build` creates only the `dist` directory and its two declared files; it never installs TermFix or changes system configuration.
+TermFix is entered in **Track A — Developer Tools & CLI**. Its runtime dependency list is empty, it uses Python’s standard library exclusively, and it works without network access.
 
-## Exit codes
-
-| Code | Meaning |
-|---:|---|
-| `0` | Successful read-only check/classification; no correction required |
-| `1` | Wrapped command failed, launch failed, no reliable correction was found, diagnostics found invalid evidence, or an acceptance/demo case failed |
-| `2` | Invalid CLI usage |
-| `3` | Reliable correction available |
-| `4` | User cancelled or interrupted the operation |
-| `5` | Safety blocked a high-risk operation, a risk-increasing correction or invalid activation target |
-| `70` | Unexpected internal failure |
-
-Target runtime: Python 3.14.7. Steps 2-14 are locally tested with Python 3.13.12.
-
-Track: **A — Developer Tools & CLI**.
+The project is available under the [MIT License](LICENSE).
