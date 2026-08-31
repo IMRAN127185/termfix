@@ -16,8 +16,27 @@ The repository currently contains:
 - **Step 11:** generate a safe, current-session PowerShell launcher for a verified portable build.
 - **Step 12:** correct strong Python interpreter-option typos and add accessible, optional terminal color.
 - **Step 13:** collect, analyze and individually review bounded multiline command pastes without accidental execution.
+- **Step 14:** locate the project automatically, build and diagnose it, then open the interactive terminal with one command.
 
 Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
+
+## One-command startup
+
+Run the complete development startup sequence with one command:
+
+```powershell
+python termfix.py start
+```
+
+It automatically uses the folder containing `termfix.py`, runs the isolated tests and deterministic build, runs Doctor, and opens `termfix>` in that project folder. If the build or Doctor fails, startup stops and the interactive terminal is not opened.
+
+It also works from another PowerShell directory when the script path is supplied:
+
+```powershell
+python "D:\Zero Dependency Hackathon\termfix.py" start
+```
+
+The TermFix session starts in `D:\Zero Dependency Hackathon`; after `exit`, the parent PowerShell window remains in its original directory because a child program cannot permanently change its parent shell's directory.
 
 ## Try it
 
@@ -201,7 +220,7 @@ python -I -S termfix.py evaluate
 
 The evaluation currently checks 21 cases covering executable, file, directory and Python-option correction; false-positive refusal; stderr evidence; destructive-command and shell-operator blocking; language-aware symbol understanding; non-mutation; accessible color fallback; indicator fallback; internal interactive commands; safe paste collection and review locking; corrupt-artifact rejection; credential redaction; and deterministic repeated analysis. It also reports observational runtime, but speed is not used as a pass condition.
 
-These commands are optional and intended for development, judging and demonstration. A normal user starts TermFix with `python termfix.py shell`. Neither `demo` nor `evaluate` launches a user command, edits project files, accesses the internet or scans the computer. They create only small isolated fixtures in the operating system's temporary directory and delete them automatically.
+These commands are optional and intended for development, judging and demonstration. A normal user can start TermFix directly with `python termfix.py shell`; a developer can use `python termfix.py start` to rebuild and diagnose it first. Neither `demo` nor `evaluate` launches a user command, edits project files, accesses the internet or scans the computer. They create only small isolated fixtures in the operating system's temporary directory and delete them automatically.
 
 ## Current-session PowerShell activation
 
@@ -311,6 +330,6 @@ Only the explicit `run` action, external commands entered inside `shell`, and th
 | `5` | Safety blocked a high-risk operation, a risk-increasing correction or invalid activation target |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-13 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-14 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.

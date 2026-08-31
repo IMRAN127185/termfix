@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-13: proof-backed correction and a portable terminal assistant.
+"""TermFix Steps 2-14: proof-backed correction and a portable terminal assistant.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
@@ -15,6 +15,7 @@ PowerShell activation is explicit, session-only, and generated without shell exe
 Interpreter-option corrections use small built-in profiles and never execute discovery code.
 Optional ANSI styling improves scanning while plain text retains every meaning.
 Paste mode separates bounded collection, analysis, unlocking, and per-line decisions.
+Startup mode composes the existing build, doctor, and interactive-shell stages.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ import zipfile
 
 
 APP_NAME = "TermFix"
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -6581,6 +6582,76 @@ def interactive_shell(
             print("Command interrupted. TermFix is still open.", file=output)
 
 
+def start_command(
+    *,
+    color_mode: str | ColorMode = ColorMode.AUTO,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Build, diagnose, then open TermFix in its own project directory."""
+
+    source = Path(__file__).resolve()
+    if not source.is_file() or source.suffix.casefold() != ".py":
+        print(
+            "termfix: start requires the termfix.py source file because it performs "
+            "a fresh build; use 'python termfix.py start'",
+            file=error_output,
+        )
+        return EXIT_USAGE
+    project_directory = source.parent
+    requirements = project_directory / "requirements.txt"
+    build_directory = project_directory / "dist"
+
+    print(f"TermFix project: {project_directory}", file=output)
+    print("", file=output)
+    print("[1/3] Building and running isolated tests...", file=output)
+    try:
+        build_result = build_command(
+            source_path=source,
+            requirements_path=requirements,
+            output_directory=build_directory,
+            output=output,
+            error_output=error_output,
+        )
+    except KeyboardInterrupt:
+        print("", file=output)
+        print("Startup cancelled during build.", file=error_output)
+        return EXIT_CANCELLED
+    if build_result != EXIT_OK:
+        print(
+            f"Startup stopped: build failed with exit code {build_result}. "
+            "Doctor and the interactive terminal were not opened.",
+            file=error_output,
+        )
+        return build_result
+
+    print("", file=output)
+    print("[2/3] Running read-only Doctor checks...", file=output)
+    doctor_result = doctor_command(
+        source_path=source,
+        requirements_path=requirements,
+        build_directory=build_directory,
+        cwd=project_directory,
+        output=output,
+    )
+    if doctor_result != EXIT_OK:
+        print(
+            f"Startup stopped: Doctor failed with exit code {doctor_result}. "
+            "The interactive terminal was not opened.",
+            file=error_output,
+        )
+        return doctor_result
+
+    print("", file=output)
+    print("[3/3] Opening the interactive terminal...", file=output)
+    return interactive_shell(
+        cwd=project_directory,
+        color_mode=color_mode,
+        output=output,
+        error_output=error_output,
+    )
+
+
 def make_parser() -> argparse.ArgumentParser:
     """Create the TermFix command-line parser."""
 
@@ -6665,6 +6736,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="start in this directory instead of the current directory",
     )
 
+    start = actions.add_parser(
+        "start",
+        help="build, run Doctor, and open TermFix in its project directory",
+    )
+    add_color_argument(start)
+
     actions.add_parser(
         "build",
         help="test and create a deterministic portable archive in dist",
@@ -6736,6 +6813,8 @@ def cli(argv: list[str] | None = None) -> int:
         )
     if args.action == "shell":
         return interactive_shell(cwd=args.cwd, color_mode=args.color)
+    if args.action == "start":
+        return start_command(color_mode=args.color)
     if args.action == "build":
         return build_command()
     if args.action == "doctor":
@@ -8997,6 +9076,86 @@ class TermFixTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_OK)
         shell.assert_called_once_with(cwd=".", color_mode="auto")
+
+    def test_start_runs_build_doctor_and_shell_in_order(self) -> None:
+        output = self._output()
+        error_output = self._output()
+        events: list[str] = []
+
+        with (
+            mock.patch(
+                __name__ + ".build_command",
+                side_effect=lambda **_kwargs: events.append("build") or EXIT_OK,
+            ) as build,
+            mock.patch(
+                __name__ + ".doctor_command",
+                side_effect=lambda **_kwargs: events.append("doctor") or EXIT_OK,
+            ) as doctor,
+            mock.patch(
+                __name__ + ".interactive_shell",
+                side_effect=lambda **_kwargs: events.append("shell") or EXIT_OK,
+            ) as shell,
+        ):
+            code = start_command(
+                color_mode="never",
+                output=output,
+                error_output=error_output,
+            )
+
+        project_directory = Path(__file__).resolve().parent
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(events, ["build", "doctor", "shell"])
+        self.assertEqual(build.call_args.kwargs["source_path"], Path(__file__).resolve())
+        self.assertEqual(
+            build.call_args.kwargs["output_directory"], project_directory / "dist"
+        )
+        self.assertEqual(doctor.call_args.kwargs["cwd"], project_directory)
+        self.assertEqual(shell.call_args.kwargs["cwd"], project_directory)
+        self.assertEqual(shell.call_args.kwargs["color_mode"], "never")
+        self.assertIn("[1/3]", output.getvalue())
+        self.assertIn("[3/3]", output.getvalue())
+
+    def test_start_stops_immediately_when_build_fails(self) -> None:
+        with (
+            mock.patch(__name__ + ".build_command", return_value=EXIT_BLOCKED),
+            mock.patch(__name__ + ".doctor_command") as doctor,
+            mock.patch(__name__ + ".interactive_shell") as shell,
+        ):
+            code = start_command(output=self._output(), error_output=self._output())
+
+        self.assertEqual(code, EXIT_BLOCKED)
+        doctor.assert_not_called()
+        shell.assert_not_called()
+
+    def test_start_rejects_portable_archive_mode_before_building(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            archive_entry = Path(folder) / "termfix.pyz" / "__main__.py"
+            with (
+                mock.patch(__name__ + ".__file__", str(archive_entry)),
+                mock.patch(__name__ + ".build_command") as build,
+            ):
+                code = start_command(
+                    output=self._output(),
+                    error_output=self._output(),
+                )
+
+        self.assertEqual(code, EXIT_USAGE)
+        build.assert_not_called()
+
+    def test_start_stops_when_doctor_fails_and_cli_routes_start(self) -> None:
+        with (
+            mock.patch(__name__ + ".build_command", return_value=EXIT_OK),
+            mock.patch(__name__ + ".doctor_command", return_value=EXIT_NOT_FOUND),
+            mock.patch(__name__ + ".interactive_shell") as shell,
+        ):
+            code = start_command(output=self._output(), error_output=self._output())
+
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        shell.assert_not_called()
+
+        with mock.patch(__name__ + ".start_command", return_value=EXIT_OK) as start:
+            self.assertEqual(cli(["start", "--color", "always"]), EXIT_OK)
+        start.assert_called_once_with(color_mode="always")
 
     def test_portable_archive_is_reproducible_and_has_one_fixed_entry(self) -> None:
         source = b"from __future__ import annotations\nimport sys\nprint(sys.version)\n"
