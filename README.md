@@ -9,8 +9,9 @@ The repository currently contains:
 - **Step 4:** recognize useful stderr patterns and derive corrections from explicit program evidence.
 - **Step 5:** classify command risk with deterministic rules before any future execution is considered.
 - **Step 6:** run approved commands with `shell=False`, capture failures and offer one safe corrected retry.
+- **Step 7:** detect the active source language and classify keywords, standard-library names and project-local declarations.
 
-Every suggestion carries local evidence. `check` and `safety` never execute the inspected command.
+Every suggestion carries local evidence. `check`, `safety` and `context` never execute the inspected command.
 
 ## Try it
 
@@ -47,6 +48,24 @@ Try a corrected run in an interactive terminal:
 ```powershell
 python termfix.py run -- pyhton --version
 ```
+
+Inspect language context and check a possible code identifier without compiling or running it:
+
+```powershell
+python termfix.py context --identifier calcluate -- gcc main.c
+```
+
+If `main.c` declares a function named `calculate`, TermFix reports C as the language and suggests `calcluate -> calculate` with the file and line as evidence. It can also distinguish a C keyword such as `while` from a C standard-library function such as `printf`.
+
+The same backend runs after a failed `run`: recognized undeclared-name errors from Python, JavaScript, Java, C and C++ are checked against the active profile and named source files. A source-backed suggestion is displayed, but TermFix never edits the source automatically.
+
+When automatic evidence is unavailable, provide an explicit language override:
+
+```powershell
+python termfix.py context --language cpp --identifier whlie -- custom-tool source.unknown
+```
+
+Deep symbol profiles are included for Python, JavaScript, Java, C and C++. TermFix can detect additional languages—including TypeScript, C#, Go, Rust, Ruby, PHP, Kotlin, Swift, Dart, Lua, Perl, R, Julia, shell and PowerShell—but does not claim deep parsing for them yet.
 
 TermFix displays the suggestion and waits for one of these choices:
 
@@ -88,12 +107,18 @@ python -I -S termfix.py self-test
 - Child processes receive an argument list and `shell=False` is always enforced.
 - High-risk operations, complex shell operators and explicit shell-command strings are blocked by `run`.
 - Failed commands may receive one stderr-backed corrected retry, which requires a new approval.
+- Language evidence can come from an explicit override, tool name, source extension, shebang, compiler/runtime error shape or direct project marker.
+- Conflicting strong language evidence produces `Unknown`; TermFix does not guess through a conflict.
+- Source inspection is limited to at most 16 explicitly named files of at most 1 MiB each.
+- Python declarations are read with the standard-library AST. JavaScript, Java, C and C++ declarations use conservative patterns after comments and strings are masked.
+- Identifier corrections come only from the active language profile or declarations proven in the explicitly named source files.
+- Recognized undeclared-identifier failures receive a compact source-backed diagnostic; source code is never silently changed.
 - Weak matches are rejected.
 - Tokens that do not require correction stay unchanged.
 - Candidate ranking is deterministic.
-- `check` and `safety` cannot call the executor.
+- `check`, `safety` and `context` cannot call the executor.
 
-Only the explicit `run` action can launch a child process. Steps 2-5 remain read-only. TermFix does not rename files, edit source code or completely parse PowerShell/Bash syntax. A Low label is conservative evidence, not a guarantee. Because `run` enforces `shell=False`, shell built-ins such as PowerShell aliases or CMD-only commands are not treated as standalone executables. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added.
+Only the explicit `run` action can launch a child process. Steps 2-5 and the Step 7 `context` diagnostic remain read-only. TermFix does not rename files, edit source code, recursively scan a project or claim to be a full compiler/parser. A Low label is conservative evidence, not a guarantee. Because `run` enforces `shell=False`, shell built-ins such as PowerShell aliases or CMD-only commands are not treated as standalone executables. `run` also refuses unresolved path arguments, so commands intended to create a new path may need to be invoked directly until command-specific argument semantics are added.
 
 ## Exit codes
 
@@ -107,6 +132,6 @@ Only the explicit `run` action can launch a child process. Steps 2-5 remain read
 | `5` | Safety blocked a high-risk command or risk-increasing correction |
 | `70` | Unexpected internal failure |
 
-Target runtime: Python 3.14.7. Steps 2-6 are locally tested with Python 3.13.12.
+Target runtime: Python 3.14.7. Steps 2-7 are locally tested with Python 3.13.12.
 
 Track: **A — Developer Tools & CLI**.

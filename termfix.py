@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""TermFix Steps 2-6: proof-backed correction and guarded command execution.
+"""TermFix Steps 2-7: proof-backed terminal correction and context detection.
 
 Executable candidates come from PATH. File and directory candidates come from
 the relevant local directory. Error evidence comes from recognized stderr
 patterns. Safety decisions come from conservative, deterministic command rules.
 The check and safety actions never execute commands. The run action uses an
 argument vector with shell=False and requires explicit approval for corrections.
+Language context and code symbols are inferred from bounded, local evidence only;
+source files are inspected but never executed or modified.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import builtins
 from dataclasses import dataclass
 import difflib
 from enum import Enum
 import json
+import keyword
 import os
 from pathlib import Path
 import re
@@ -27,7 +32,7 @@ from unittest import mock
 
 
 APP_NAME = "TermFix"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
@@ -40,6 +45,8 @@ EXIT_INTERNAL = 70
 MINIMUM_MATCH_SCORE = 70
 HIGH_MATCH_SCORE = 85
 WINDOWS_EXECUTABLE_EXTENSIONS = (".com", ".exe", ".bat", ".cmd")
+MAX_SOURCE_FILES = 16
+MAX_SOURCE_BYTES = 1_048_576
 
 
 class MatchLabel(str, Enum):
@@ -69,10 +76,256 @@ class RiskLevel(str, Enum):
     HIGH = "High"
 
 
+class SourceLanguage(str, Enum):
+    """Source languages TermFix can identify from local evidence."""
+
+    UNKNOWN = "Unknown"
+    PYTHON = "Python"
+    JAVASCRIPT = "JavaScript"
+    TYPESCRIPT = "TypeScript"
+    C = "C"
+    CPP = "C++"
+    JAVA = "Java"
+    CSHARP = "C#"
+    GO = "Go"
+    RUST = "Rust"
+    RUBY = "Ruby"
+    PHP = "PHP"
+    KOTLIN = "Kotlin"
+    SWIFT = "Swift"
+    DART = "Dart"
+    LUA = "Lua"
+    PERL = "Perl"
+    R = "R"
+    JULIA = "Julia"
+    SHELL = "Shell"
+    POWERSHELL = "PowerShell"
+
+
+class DetectionConfidence(str, Enum):
+    """Strength of the evidence used for a language decision."""
+
+    HIGH = "High"
+    MEDIUM = "Medium"
+    LOW = "Low"
+
+
+class SymbolKind(str, Enum):
+    """Honest categories for profile-backed and project-local identifiers."""
+
+    KEYWORD = "keyword"
+    BUILTIN = "built-in"
+    STANDARD_LIBRARY = "standard-library symbol"
+    LOCAL_FUNCTION = "local function"
+    LOCAL_CLASS = "local class"
+    LOCAL_VARIABLE = "local variable"
+    IMPORT = "import"
+    UNKNOWN = "unknown"
+
+
 RISK_PRIORITY = {
     RiskLevel.LOW: 1,
     RiskLevel.MEDIUM: 2,
     RiskLevel.HIGH: 3,
+}
+
+DEEP_PROFILE_LANGUAGES = frozenset(
+    {
+        SourceLanguage.PYTHON,
+        SourceLanguage.JAVASCRIPT,
+        SourceLanguage.JAVA,
+        SourceLanguage.C,
+        SourceLanguage.CPP,
+    }
+)
+
+LANGUAGE_ALIASES = {
+    "python": SourceLanguage.PYTHON,
+    "py": SourceLanguage.PYTHON,
+    "javascript": SourceLanguage.JAVASCRIPT,
+    "js": SourceLanguage.JAVASCRIPT,
+    "typescript": SourceLanguage.TYPESCRIPT,
+    "ts": SourceLanguage.TYPESCRIPT,
+    "c": SourceLanguage.C,
+    "c++": SourceLanguage.CPP,
+    "cpp": SourceLanguage.CPP,
+    "cxx": SourceLanguage.CPP,
+    "java": SourceLanguage.JAVA,
+    "c#": SourceLanguage.CSHARP,
+    "csharp": SourceLanguage.CSHARP,
+    "cs": SourceLanguage.CSHARP,
+    "go": SourceLanguage.GO,
+    "golang": SourceLanguage.GO,
+    "rust": SourceLanguage.RUST,
+    "ruby": SourceLanguage.RUBY,
+    "php": SourceLanguage.PHP,
+    "kotlin": SourceLanguage.KOTLIN,
+    "swift": SourceLanguage.SWIFT,
+    "dart": SourceLanguage.DART,
+    "lua": SourceLanguage.LUA,
+    "perl": SourceLanguage.PERL,
+    "r": SourceLanguage.R,
+    "julia": SourceLanguage.JULIA,
+    "shell": SourceLanguage.SHELL,
+    "sh": SourceLanguage.SHELL,
+    "bash": SourceLanguage.SHELL,
+    "powershell": SourceLanguage.POWERSHELL,
+    "pwsh": SourceLanguage.POWERSHELL,
+}
+
+SOURCE_EXTENSIONS = {
+    ".py": SourceLanguage.PYTHON,
+    ".pyw": SourceLanguage.PYTHON,
+    ".js": SourceLanguage.JAVASCRIPT,
+    ".mjs": SourceLanguage.JAVASCRIPT,
+    ".cjs": SourceLanguage.JAVASCRIPT,
+    ".ts": SourceLanguage.TYPESCRIPT,
+    ".tsx": SourceLanguage.TYPESCRIPT,
+    ".c": SourceLanguage.C,
+    ".h": SourceLanguage.C,
+    ".cc": SourceLanguage.CPP,
+    ".cpp": SourceLanguage.CPP,
+    ".cxx": SourceLanguage.CPP,
+    ".hh": SourceLanguage.CPP,
+    ".hpp": SourceLanguage.CPP,
+    ".hxx": SourceLanguage.CPP,
+    ".java": SourceLanguage.JAVA,
+    ".cs": SourceLanguage.CSHARP,
+    ".go": SourceLanguage.GO,
+    ".rs": SourceLanguage.RUST,
+    ".rb": SourceLanguage.RUBY,
+    ".php": SourceLanguage.PHP,
+    ".kt": SourceLanguage.KOTLIN,
+    ".kts": SourceLanguage.KOTLIN,
+    ".swift": SourceLanguage.SWIFT,
+    ".dart": SourceLanguage.DART,
+    ".lua": SourceLanguage.LUA,
+    ".pl": SourceLanguage.PERL,
+    ".pm": SourceLanguage.PERL,
+    ".r": SourceLanguage.R,
+    ".jl": SourceLanguage.JULIA,
+    ".sh": SourceLanguage.SHELL,
+    ".bash": SourceLanguage.SHELL,
+    ".zsh": SourceLanguage.SHELL,
+    ".ps1": SourceLanguage.POWERSHELL,
+}
+
+TOOL_LANGUAGES = {
+    "python": SourceLanguage.PYTHON,
+    "python3": SourceLanguage.PYTHON,
+    "py": SourceLanguage.PYTHON,
+    "node": SourceLanguage.JAVASCRIPT,
+    "nodejs": SourceLanguage.JAVASCRIPT,
+    "bun": SourceLanguage.JAVASCRIPT,
+    "deno": SourceLanguage.JAVASCRIPT,
+    "javac": SourceLanguage.JAVA,
+    "java": SourceLanguage.JAVA,
+    "gcc": SourceLanguage.C,
+    "cc": SourceLanguage.C,
+    "clang": SourceLanguage.C,
+    "g++": SourceLanguage.CPP,
+    "c++": SourceLanguage.CPP,
+    "clang++": SourceLanguage.CPP,
+    "csc": SourceLanguage.CSHARP,
+    "dotnet": SourceLanguage.CSHARP,
+    "go": SourceLanguage.GO,
+    "rustc": SourceLanguage.RUST,
+    "cargo": SourceLanguage.RUST,
+    "ruby": SourceLanguage.RUBY,
+    "php": SourceLanguage.PHP,
+    "kotlinc": SourceLanguage.KOTLIN,
+    "kotlin": SourceLanguage.KOTLIN,
+    "swift": SourceLanguage.SWIFT,
+    "swiftc": SourceLanguage.SWIFT,
+    "dart": SourceLanguage.DART,
+    "lua": SourceLanguage.LUA,
+    "perl": SourceLanguage.PERL,
+    "rscript": SourceLanguage.R,
+    "julia": SourceLanguage.JULIA,
+    "bash": SourceLanguage.SHELL,
+    "sh": SourceLanguage.SHELL,
+    "zsh": SourceLanguage.SHELL,
+    "pwsh": SourceLanguage.POWERSHELL,
+    "powershell": SourceLanguage.POWERSHELL,
+}
+
+PROJECT_MARKERS = {
+    "pyproject.toml": SourceLanguage.PYTHON,
+    "setup.py": SourceLanguage.PYTHON,
+    "package.json": SourceLanguage.JAVASCRIPT,
+    "pom.xml": SourceLanguage.JAVA,
+    "build.gradle": SourceLanguage.JAVA,
+    "cargo.toml": SourceLanguage.RUST,
+    "go.mod": SourceLanguage.GO,
+}
+
+PROFILE_KEYWORDS = {
+    SourceLanguage.PYTHON: frozenset(keyword.kwlist),
+    SourceLanguage.JAVASCRIPT: frozenset(
+        "await break case catch class const continue debugger default delete do else "
+        "export extends finally for function if import in instanceof let new return "
+        "static super switch this throw try typeof var void while with yield async of"
+        .split()
+    ),
+    SourceLanguage.JAVA: frozenset(
+        "abstract assert boolean break byte case catch char class const continue "
+        "default do double else enum extends final finally float for goto if "
+        "implements import instanceof int interface long native new package private "
+        "protected public return short static strictfp super switch synchronized this "
+        "throw throws transient try void volatile while record sealed permits var"
+        .split()
+    ),
+    SourceLanguage.C: frozenset(
+        "auto break case char const continue default do double else enum extern float "
+        "for goto if inline int long register restrict return short signed sizeof "
+        "static struct switch typedef union unsigned void volatile while _Alignas "
+        "_Alignof _Atomic _Bool _Complex _Generic _Imaginary _Noreturn _Static_assert "
+        "_Thread_local"
+        .split()
+    ),
+    SourceLanguage.CPP: frozenset(
+        "alignas alignof and and_eq asm auto bitand bitor bool break case catch char "
+        "char8_t char16_t char32_t class compl concept const consteval constexpr "
+        "constinit const_cast continue co_await co_return co_yield decltype default "
+        "delete do double dynamic_cast else enum explicit export extern false float "
+        "for friend goto if inline int long mutable namespace new noexcept not not_eq "
+        "nullptr operator or or_eq private protected public register reinterpret_cast "
+        "requires return short signed sizeof static static_assert static_cast struct "
+        "switch template this thread_local throw true try typedef typeid typename union "
+        "unsigned using virtual void volatile wchar_t while xor xor_eq"
+        .split()
+    ),
+}
+
+PROFILE_BUILTINS = {
+    SourceLanguage.PYTHON: frozenset(dir(builtins)),
+    SourceLanguage.JAVASCRIPT: frozenset(
+        "Array BigInt Boolean Date Error Function JSON Map Math Number Object Promise "
+        "RegExp Set String Symbol WeakMap WeakSet console decodeURI encodeURI eval "
+        "fetch isFinite isNaN parseFloat parseInt queueMicrotask setInterval setTimeout"
+        .split()
+    ),
+}
+
+PROFILE_STANDARD_LIBRARY = {
+    SourceLanguage.JAVA: frozenset(
+        "Boolean Byte Character Class Double Enum Exception Float Integer Long Math "
+        "Object Runtime Short String StringBuilder System Thread Throwable Void"
+        .split()
+    ),
+    SourceLanguage.C: frozenset(
+        "calloc fclose feof ferror fflush fgets fopen fprintf fputs fread free fscanf "
+        "fseek fwrite getchar gets malloc memcpy memmove memset perror printf putchar "
+        "puts realloc scanf snprintf sprintf stderr stdin stdout strcat strchr strcmp "
+        "strcpy strlen strncmp strncpy strstr strtol"
+        .split()
+    ),
+    SourceLanguage.CPP: frozenset(
+        "array cerr cin clog cout deque endl forward_list list make_pair map move pair "
+        "priority_queue queue set shared_ptr sort stack string swap tuple unique_ptr "
+        "unordered_map unordered_set vector weak_ptr"
+        .split()
+    ),
 }
 
 
@@ -166,6 +419,50 @@ class SafetyAssessment:
 
 
 @dataclass(frozen=True)
+class LanguageContext:
+    """A deterministic source-language decision and the evidence behind it."""
+
+    shell: str
+    tool: str | None
+    language: SourceLanguage
+    source_files: tuple[str, ...]
+    evidence: tuple[str, ...]
+    confidence: DetectionConfidence
+    deep_profile: bool
+
+
+@dataclass(frozen=True)
+class CodeSymbol:
+    """One identifier proven by a built-in profile or explicit source file."""
+
+    name: str
+    kind: SymbolKind
+    source: str
+    line: int | None = None
+
+
+@dataclass(frozen=True)
+class LanguageUnderstanding:
+    """Language context plus symbols obtained without executing source code."""
+
+    context: LanguageContext
+    symbols: tuple[CodeSymbol, ...]
+
+
+@dataclass(frozen=True)
+class IdentifierCorrection:
+    """A profile- or source-backed correction for one code identifier."""
+
+    original: str
+    suggested: str
+    kind: SymbolKind
+    score: int
+    label: MatchLabel
+    reason: str
+    evidence: str
+
+
+@dataclass(frozen=True)
 class PreflightAnalysis:
     """Structured correction and safety evidence prepared before execution."""
 
@@ -178,6 +475,7 @@ class PreflightAnalysis:
     original_safety: SafetyAssessment
     suggested_safety: SafetyAssessment
     risk_increased: bool
+    language_understanding: LanguageUnderstanding
 
     @property
     def has_correction(self) -> bool:
@@ -223,6 +521,728 @@ def environment_value(env: dict[str, str], name: str) -> str | None:
         if key.casefold() == folded_name:
             return value
     return None
+
+
+def language_from_name(value: str | SourceLanguage) -> SourceLanguage:
+    """Parse an explicit language name or raise a useful validation error."""
+
+    if isinstance(value, SourceLanguage):
+        return value
+    language = LANGUAGE_ALIASES.get(str(value).strip().casefold())
+    if language is None:
+        supported = ", ".join(sorted(LANGUAGE_ALIASES))
+        raise ValueError(f"unsupported language {value!r}; choose one of: {supported}")
+    return language
+
+
+def normalized_tool_name(token: str) -> str:
+    """Return an executable basename suitable for deterministic tool matching."""
+
+    name = Path(str(token).replace("\\", "/")).name.casefold()
+    for suffix in WINDOWS_EXECUTABLE_EXTENSIONS:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def detect_shell(
+    env: dict[str, str] | None = None,
+    *,
+    explicit_shell: str | None = None,
+) -> str:
+    """Describe the outer shell using an override or conservative environment clues."""
+
+    if explicit_shell and explicit_shell.strip():
+        return explicit_shell.strip()
+    environment = selected_environment(env)
+    shell_value = environment_value(environment, "SHELL")
+    if shell_value:
+        return Path(shell_value.replace("\\", "/")).name or shell_value
+    if environment_value(environment, "PSModulePath"):
+        return "PowerShell-compatible environment"
+    command_shell = environment_value(environment, "COMSPEC")
+    if command_shell:
+        return Path(command_shell.replace("\\", "/")).name or command_shell
+    return "Unknown"
+
+
+def bounded_source_text(path: Path) -> str | None:
+    """Read at most one small, explicit source file; never execute or modify it."""
+
+    try:
+        if not path.is_file() or path.stat().st_size > MAX_SOURCE_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def language_from_shebang(path: Path) -> SourceLanguage | None:
+    """Infer a language from the first line of an explicitly named local file."""
+
+    text = bounded_source_text(path)
+    if text is None:
+        return None
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    if not first_line.startswith("#!"):
+        return None
+    lowered = first_line.casefold()
+    if re.search(r"(?:^|[/\s])python(?:\d+(?:\.\d+)*)?(?:\s|$)", lowered):
+        return SourceLanguage.PYTHON
+    shebang_names = (
+        ("node", SourceLanguage.JAVASCRIPT),
+        ("deno", SourceLanguage.JAVASCRIPT),
+        ("ruby", SourceLanguage.RUBY),
+        ("php", SourceLanguage.PHP),
+        ("perl", SourceLanguage.PERL),
+        ("julia", SourceLanguage.JULIA),
+        ("pwsh", SourceLanguage.POWERSHELL),
+        ("powershell", SourceLanguage.POWERSHELL),
+        ("bash", SourceLanguage.SHELL),
+        ("zsh", SourceLanguage.SHELL),
+        ("sh", SourceLanguage.SHELL),
+    )
+    for name, language in shebang_names:
+        if re.search(rf"(?:^|[/\s]){re.escape(name)}(?:\s|$)", lowered):
+            return language
+    return None
+
+
+def explicit_source_files(
+    argv: list[str] | tuple[str, ...],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> tuple[tuple[str, SourceLanguage | None], ...]:
+    """Find bounded source-file arguments without recursively scanning a project."""
+
+    root = Path.cwd() if cwd is None else Path(cwd)
+    found: list[tuple[str, SourceLanguage | None]] = []
+    seen: set[str] = set()
+    for token in argv:
+        if len(found) >= MAX_SOURCE_FILES:
+            break
+        value = str(token)
+        if not value or value.startswith("-") or "://" in value:
+            continue
+        try:
+            path = Path(value)
+            resolved = path if path.is_absolute() else root / path
+            extension_language = SOURCE_EXTENSIONS.get(path.suffix.casefold())
+            shebang_language = None
+            if extension_language is None and resolved.is_file():
+                shebang_language = language_from_shebang(resolved)
+            language = extension_language or shebang_language
+            if language is None:
+                continue
+            display_path = str(resolved.resolve(strict=False))
+        except (OSError, ValueError):
+            continue
+        key = display_path.casefold() if os.name == "nt" else display_path
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append((display_path, language))
+    return tuple(found)
+
+
+def language_from_error(error_text: str | None) -> SourceLanguage | None:
+    """Recognize language-specific compiler/runtime error shapes."""
+
+    if not error_text:
+        return None
+    sample = error_text[-65536:]
+    rules = (
+        (r"Traceback \(most recent call last\)|\b(?:NameError|SyntaxError):", SourceLanguage.PYTHON),
+        (r"\b(?:javac|java):|\.java:\d+: error:", SourceLanguage.JAVA),
+        (r"\b(?:rustc|cargo):|error\[E\d{4}\]", SourceLanguage.RUST),
+        (r"\bnode(?:\.exe)?:|\bReferenceError:|\bTypeError:.*\bat ", SourceLanguage.JAVASCRIPT),
+        (r"\.cpp:\d+(?::\d+)?: (?:error|warning):", SourceLanguage.CPP),
+        (r"\.c:\d+(?::\d+)?: (?:error|warning):", SourceLanguage.C),
+    )
+    for pattern, language in rules:
+        if re.search(pattern, sample, re.IGNORECASE | re.MULTILINE):
+            return language
+    return None
+
+
+def language_from_project_marker(root: Path) -> tuple[SourceLanguage | None, str | None]:
+    """Inspect only direct project markers in the working directory."""
+
+    matches: list[tuple[SourceLanguage, str]] = []
+    for marker, language in PROJECT_MARKERS.items():
+        try:
+            if (root / marker).is_file():
+                matches.append((language, marker))
+        except OSError:
+            continue
+    try:
+        for path in sorted(root.glob("*.csproj"), key=lambda item: item.name.casefold()):
+            if path.is_file():
+                matches.append((SourceLanguage.CSHARP, path.name))
+                break
+    except OSError:
+        pass
+    languages = {language for language, _marker in matches}
+    if len(languages) != 1:
+        return None, None
+    language = next(iter(languages))
+    marker = sorted(marker for item_language, marker in matches if item_language is language)[0]
+    return language, marker
+
+
+def compatible_language_decision(
+    tool_language: SourceLanguage,
+    source_language: SourceLanguage,
+) -> SourceLanguage | None:
+    """Resolve known compiler-family combinations and reject real conflicts."""
+
+    if tool_language is source_language:
+        return source_language
+    if tool_language is SourceLanguage.JAVASCRIPT and source_language is SourceLanguage.TYPESCRIPT:
+        return SourceLanguage.TYPESCRIPT
+    if tool_language is SourceLanguage.C and source_language is SourceLanguage.CPP:
+        return SourceLanguage.CPP
+    if tool_language is SourceLanguage.CPP and source_language is SourceLanguage.C:
+        return SourceLanguage.CPP
+    return None
+
+
+def detect_language_context(
+    argv: list[str] | tuple[str, ...],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    env: dict[str, str] | None = None,
+    explicit_language: str | SourceLanguage | None = None,
+    explicit_shell: str | None = None,
+    error_text: str | None = None,
+) -> LanguageContext:
+    """Detect source context from bounded local evidence, never from execution."""
+
+    command = tuple(str(token) for token in argv)
+    root = Path.cwd() if cwd is None else Path(cwd)
+    tool = normalized_tool_name(command[0]) if command else None
+    tool_language = TOOL_LANGUAGES.get(tool or "")
+    source_records = explicit_source_files(command, cwd=root)
+    source_languages = {language for _path, language in source_records if language}
+    evidence: list[str] = []
+
+    if tool_language is not None:
+        evidence.append(f"tool {tool!r} is associated with {tool_language.value}")
+    for path, language in source_records:
+        assert language is not None
+        suffix = Path(path).suffix or "shebang"
+        evidence.append(f"source {Path(path).name!r} indicates {language.value} ({suffix})")
+
+    if explicit_language is not None:
+        selected = language_from_name(explicit_language)
+        evidence.insert(0, f"explicit language override selected {selected.value}")
+        return LanguageContext(
+            shell=detect_shell(env, explicit_shell=explicit_shell),
+            tool=tool,
+            language=selected,
+            source_files=tuple(path for path, _language in source_records),
+            evidence=tuple(evidence),
+            confidence=DetectionConfidence.HIGH,
+            deep_profile=selected in DEEP_PROFILE_LANGUAGES,
+        )
+
+    source_language = next(iter(source_languages)) if len(source_languages) == 1 else None
+    if len(source_languages) > 1:
+        names = ", ".join(sorted(language.value for language in source_languages))
+        evidence.append(f"conflicting source languages were present: {names}")
+        selected = SourceLanguage.UNKNOWN
+        confidence = DetectionConfidence.LOW
+    elif tool_language is not None and source_language is not None:
+        compatible = compatible_language_decision(tool_language, source_language)
+        if compatible is None:
+            evidence.append("tool and source language evidence conflict")
+            selected = SourceLanguage.UNKNOWN
+            confidence = DetectionConfidence.LOW
+        else:
+            selected = compatible
+            confidence = DetectionConfidence.HIGH
+    elif source_language is not None:
+        selected = source_language
+        confidence = DetectionConfidence.HIGH
+    elif tool_language is not None:
+        selected = tool_language
+        confidence = DetectionConfidence.MEDIUM
+    else:
+        error_language = language_from_error(error_text)
+        if error_language is not None:
+            selected = error_language
+            confidence = DetectionConfidence.MEDIUM
+            evidence.append(f"recognized {error_language.value} compiler/runtime error shape")
+        else:
+            marker_language, marker = language_from_project_marker(root)
+            if marker_language is not None and marker is not None:
+                selected = marker_language
+                confidence = DetectionConfidence.LOW
+                evidence.append(f"project marker {marker!r} indicates {marker_language.value}")
+            else:
+                selected = SourceLanguage.UNKNOWN
+                confidence = DetectionConfidence.LOW
+                evidence.append("no reliable language evidence was found")
+
+    return LanguageContext(
+        shell=detect_shell(env, explicit_shell=explicit_shell),
+        tool=tool,
+        language=selected,
+        source_files=tuple(path for path, _language in source_records),
+        evidence=tuple(evidence),
+        confidence=confidence,
+        deep_profile=selected in DEEP_PROFILE_LANGUAGES,
+    )
+
+
+def symbol_line(text: str, offset: int) -> int:
+    """Return a stable one-based line number for a regex match offset."""
+
+    return text.count("\n", 0, offset) + 1
+
+
+def mask_c_like_comments_and_strings(text: str) -> str:
+    """Mask C-family comments and strings while preserving offsets and newlines."""
+
+    result = list(text)
+    index = 0
+    state = "code"
+    quote = ""
+    while index < len(text):
+        character = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if state == "code":
+            if character == "/" and following == "/":
+                result[index] = result[index + 1] = " "
+                index += 2
+                state = "line-comment"
+                continue
+            if character == "/" and following == "*":
+                result[index] = result[index + 1] = " "
+                index += 2
+                state = "block-comment"
+                continue
+            if character in {'"', "'", "`"}:
+                quote = character
+                result[index] = " "
+                index += 1
+                state = "string"
+                continue
+        elif state == "line-comment":
+            if character == "\n":
+                state = "code"
+            else:
+                result[index] = " "
+        elif state == "block-comment":
+            if character == "*" and following == "/":
+                result[index] = result[index + 1] = " "
+                index += 2
+                state = "code"
+                continue
+            if character != "\n":
+                result[index] = " "
+        else:
+            if character == "\\" and following:
+                result[index] = " "
+                if following != "\n":
+                    result[index + 1] = " "
+                index += 2
+                continue
+            if character == quote:
+                result[index] = " "
+                state = "code"
+            elif character != "\n":
+                result[index] = " "
+        index += 1
+    return "".join(result)
+
+
+def python_source_symbols(text: str, source: str) -> tuple[CodeSymbol, ...]:
+    """Extract Python declarations with the standard-library AST only."""
+
+    try:
+        tree = ast.parse(text, filename=source)
+    except (SyntaxError, ValueError, TypeError):
+        return ()
+    symbols: list[CodeSymbol] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append(CodeSymbol(node.name, SymbolKind.LOCAL_FUNCTION, source, node.lineno))
+        elif isinstance(node, ast.ClassDef):
+            symbols.append(CodeSymbol(node.name, SymbolKind.LOCAL_CLASS, source, node.lineno))
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            symbols.append(CodeSymbol(node.id, SymbolKind.LOCAL_VARIABLE, source, node.lineno))
+        elif isinstance(node, ast.arg):
+            symbols.append(CodeSymbol(node.arg, SymbolKind.LOCAL_VARIABLE, source, node.lineno))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".", 1)[0]
+                symbols.append(CodeSymbol(name, SymbolKind.IMPORT, source, node.lineno))
+    return tuple(symbols)
+
+
+def javascript_source_symbols(text: str, source: str) -> tuple[CodeSymbol, ...]:
+    """Extract conservative JavaScript declarations from masked source."""
+
+    masked = mask_c_like_comments_and_strings(text)
+    symbols: list[CodeSymbol] = []
+    arrow_names: set[str] = set()
+    patterns = (
+        (r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", SymbolKind.LOCAL_FUNCTION),
+        (r"\bclass\s+([A-Za-z_$][\w$]*)\b", SymbolKind.LOCAL_CLASS),
+        (
+            r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>",
+            SymbolKind.LOCAL_FUNCTION,
+        ),
+    )
+    for pattern, kind in patterns:
+        for match in re.finditer(pattern, masked, re.MULTILINE):
+            name = match.group(1)
+            if kind is SymbolKind.LOCAL_FUNCTION and "=>" in match.group(0):
+                arrow_names.add(name)
+            symbols.append(CodeSymbol(name, kind, source, symbol_line(masked, match.start(1))))
+    for match in re.finditer(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b",
+        masked,
+        re.MULTILINE,
+    ):
+        name = match.group(1)
+        if name not in arrow_names:
+            symbols.append(
+                CodeSymbol(name, SymbolKind.LOCAL_VARIABLE, source, symbol_line(masked, match.start(1)))
+            )
+    for match in re.finditer(
+        r"\bimport\s+(?:\{\s*)?([A-Za-z_$][\w$]*)",
+        masked,
+        re.MULTILINE,
+    ):
+        symbols.append(
+            CodeSymbol(match.group(1), SymbolKind.IMPORT, source, symbol_line(masked, match.start(1)))
+        )
+    return tuple(symbols)
+
+
+def java_source_symbols(text: str, source: str) -> tuple[CodeSymbol, ...]:
+    """Extract Java type and method declarations conservatively."""
+
+    masked = mask_c_like_comments_and_strings(text)
+    symbols: list[CodeSymbol] = []
+    class_names: set[str] = set()
+    for match in re.finditer(
+        r"\b(?:class|interface|enum|record)\s+([A-Za-z_$][\w$]*)\b",
+        masked,
+    ):
+        class_names.add(match.group(1))
+        symbols.append(
+            CodeSymbol(match.group(1), SymbolKind.LOCAL_CLASS, source, symbol_line(masked, match.start(1)))
+        )
+    method_pattern = re.compile(
+        r"(?m)^\s*(?:(?:public|protected|private|static|final|abstract|synchronized|native|default|strictfp)\s+)*"
+        r"(?:<[^>]+>\s*)?(?:[A-Za-z_$][\w$]*(?:\s*<[^;{}()]+>)?(?:\[\])?\s+)+"
+        r"([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?:throws\s+[^{}]+)?(?:\{|;)",
+    )
+    for match in method_pattern.finditer(masked):
+        name = match.group(1)
+        symbols.append(CodeSymbol(name, SymbolKind.LOCAL_FUNCTION, source, symbol_line(masked, match.start(1))))
+    for class_name in class_names:
+        constructor = re.compile(
+            rf"(?m)^\s*(?:(?:public|protected|private)\s+)?({re.escape(class_name)})\s*\([^;{{}}]*\)\s*{{"
+        )
+        for match in constructor.finditer(masked):
+            symbols.append(
+                CodeSymbol(match.group(1), SymbolKind.LOCAL_FUNCTION, source, symbol_line(masked, match.start(1)))
+            )
+    return tuple(symbols)
+
+
+def c_family_source_symbols(
+    text: str,
+    source: str,
+    *,
+    cpp: bool,
+) -> tuple[CodeSymbol, ...]:
+    """Extract C/C++ functions and declared types from masked source."""
+
+    masked = mask_c_like_comments_and_strings(text)
+    symbols: list[CodeSymbol] = []
+    type_words = "class|struct|enum|union" if cpp else "struct|enum|union"
+    for match in re.finditer(rf"\b(?:{type_words})\s+([A-Za-z_]\w*)\b", masked):
+        symbols.append(
+            CodeSymbol(match.group(1), SymbolKind.LOCAL_CLASS, source, symbol_line(masked, match.start(1)))
+        )
+    function_pattern = re.compile(
+        r"(?m)^\s*(?:(?:static|extern|inline|constexpr|virtual|friend|explicit|consteval)\s+)*"
+        r"(?:[A-Za-z_]\w*(?:::[A-Za-z_]\w*)?(?:\s*<[^;{}()]+>)?[\s*&]+)+"
+        r"(?:[A-Za-z_]\w*::)*([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:\{|;)",
+    )
+    controls = {"if", "for", "while", "switch", "catch", "return", "sizeof"}
+    for match in function_pattern.finditer(masked):
+        name = match.group(1)
+        if name not in controls:
+            symbols.append(
+                CodeSymbol(name, SymbolKind.LOCAL_FUNCTION, source, symbol_line(masked, match.start(1)))
+            )
+    return tuple(symbols)
+
+
+def unique_symbols(symbols: list[CodeSymbol] | tuple[CodeSymbol, ...]) -> tuple[CodeSymbol, ...]:
+    """Deduplicate and sort symbols so the same evidence always gives the same result."""
+
+    unique: dict[tuple[str, SymbolKind, str, int | None], CodeSymbol] = {}
+    for symbol in symbols:
+        unique[(symbol.name, symbol.kind, symbol.source, symbol.line)] = symbol
+    return tuple(
+        sorted(
+            unique.values(),
+            key=lambda item: (
+                item.name.casefold(),
+                item.name,
+                item.kind.value,
+                item.source.casefold(),
+                item.line or 0,
+            ),
+        )
+    )
+
+
+def inspect_code_symbols(context: LanguageContext) -> tuple[CodeSymbol, ...]:
+    """Inspect only explicitly named, bounded source files for supported languages."""
+
+    if not context.deep_profile:
+        return ()
+    symbols: list[CodeSymbol] = []
+    for source in context.source_files[:MAX_SOURCE_FILES]:
+        path = Path(source)
+        text = bounded_source_text(path)
+        if text is None:
+            continue
+        if context.language is SourceLanguage.PYTHON:
+            symbols.extend(python_source_symbols(text, source))
+        elif context.language is SourceLanguage.JAVASCRIPT:
+            symbols.extend(javascript_source_symbols(text, source))
+        elif context.language is SourceLanguage.JAVA:
+            symbols.extend(java_source_symbols(text, source))
+        elif context.language in {SourceLanguage.C, SourceLanguage.CPP}:
+            symbols.extend(
+                c_family_source_symbols(
+                    text,
+                    source,
+                    cpp=context.language is SourceLanguage.CPP,
+                )
+            )
+    return unique_symbols(symbols)
+
+
+def understand_language_context(
+    argv: list[str] | tuple[str, ...],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    env: dict[str, str] | None = None,
+    explicit_language: str | SourceLanguage | None = None,
+    explicit_shell: str | None = None,
+    error_text: str | None = None,
+) -> LanguageUnderstanding:
+    """Build a read-only language context and its bounded local symbol table."""
+
+    context = detect_language_context(
+        argv,
+        cwd=cwd,
+        env=env,
+        explicit_language=explicit_language,
+        explicit_shell=explicit_shell,
+        error_text=error_text,
+    )
+    return LanguageUnderstanding(context, inspect_code_symbols(context))
+
+
+def classify_identifier(
+    identifier: str,
+    understanding: LanguageUnderstanding,
+) -> CodeSymbol:
+    """Classify an exact identifier using language and explicit-source evidence."""
+
+    language = understanding.context.language
+    if identifier in PROFILE_KEYWORDS.get(language, frozenset()):
+        return CodeSymbol(identifier, SymbolKind.KEYWORD, f"{language.value} keyword profile")
+    local_priority = {
+        SymbolKind.LOCAL_FUNCTION: 1,
+        SymbolKind.LOCAL_CLASS: 2,
+        SymbolKind.LOCAL_VARIABLE: 3,
+        SymbolKind.IMPORT: 4,
+    }
+    local_matches = [symbol for symbol in understanding.symbols if symbol.name == identifier]
+    if local_matches:
+        return sorted(
+            local_matches,
+            key=lambda item: (local_priority.get(item.kind, 99), item.source.casefold(), item.line or 0),
+        )[0]
+    if identifier in PROFILE_BUILTINS.get(language, frozenset()):
+        return CodeSymbol(identifier, SymbolKind.BUILTIN, f"{language.value} built-in profile")
+    if identifier in PROFILE_STANDARD_LIBRARY.get(language, frozenset()):
+        return CodeSymbol(
+            identifier,
+            SymbolKind.STANDARD_LIBRARY,
+            f"{language.value} standard-library profile",
+        )
+    return CodeSymbol(identifier, SymbolKind.UNKNOWN, "no matching profile or local declaration")
+
+
+def identifier_candidates(understanding: LanguageUnderstanding) -> tuple[CodeSymbol, ...]:
+    """Return deterministic correction candidates backed by profiles or source."""
+
+    language = understanding.context.language
+    candidates = list(understanding.symbols)
+    candidates.extend(
+        CodeSymbol(name, SymbolKind.KEYWORD, f"{language.value} keyword profile")
+        for name in PROFILE_KEYWORDS.get(language, frozenset())
+    )
+    candidates.extend(
+        CodeSymbol(name, SymbolKind.BUILTIN, f"{language.value} built-in profile")
+        for name in PROFILE_BUILTINS.get(language, frozenset())
+    )
+    candidates.extend(
+        CodeSymbol(name, SymbolKind.STANDARD_LIBRARY, f"{language.value} standard-library profile")
+        for name in PROFILE_STANDARD_LIBRARY.get(language, frozenset())
+    )
+    best_by_name: dict[str, CodeSymbol] = {}
+    priority = {
+        SymbolKind.LOCAL_FUNCTION: 1,
+        SymbolKind.LOCAL_CLASS: 2,
+        SymbolKind.LOCAL_VARIABLE: 3,
+        SymbolKind.IMPORT: 4,
+        SymbolKind.KEYWORD: 5,
+        SymbolKind.BUILTIN: 6,
+        SymbolKind.STANDARD_LIBRARY: 7,
+    }
+    for candidate in candidates:
+        current = best_by_name.get(candidate.name)
+        if current is None or priority.get(candidate.kind, 99) < priority.get(current.kind, 99):
+            best_by_name[candidate.name] = candidate
+    return tuple(sorted(best_by_name.values(), key=lambda item: (item.name.casefold(), item.name)))
+
+
+def find_identifier_correction(
+    identifier: str,
+    understanding: LanguageUnderstanding,
+) -> IdentifierCorrection | None:
+    """Suggest one reliable identifier correction from language/project evidence."""
+
+    if not re.fullmatch(r"[A-Za-z_$][\w$]*", identifier, re.UNICODE):
+        return None
+    if classify_identifier(identifier, understanding).kind is not SymbolKind.UNKNOWN:
+        return None
+    ranked: list[tuple[int, int, str, str, CodeSymbol, str]] = []
+    kind_priority = {
+        SymbolKind.LOCAL_FUNCTION: 1,
+        SymbolKind.LOCAL_CLASS: 2,
+        SymbolKind.LOCAL_VARIABLE: 3,
+        SymbolKind.IMPORT: 4,
+        SymbolKind.KEYWORD: 5,
+        SymbolKind.BUILTIN: 6,
+        SymbolKind.STANDARD_LIBRARY: 7,
+    }
+    for candidate in identifier_candidates(understanding):
+        if candidate.name.casefold() == identifier.casefold():
+            continue
+        score, reason = similarity_score(identifier, candidate.name)
+        if score < MINIMUM_MATCH_SCORE:
+            continue
+        ranked.append(
+            (
+                -score,
+                kind_priority.get(candidate.kind, 99),
+                candidate.name.casefold(),
+                candidate.name,
+                candidate,
+                reason,
+            )
+        )
+    if not ranked:
+        return None
+    _negative_score, _priority, _folded, _name, candidate, reason = sorted(ranked)[0]
+    score = -_negative_score
+    line = f" line {candidate.line}" if candidate.line is not None else ""
+    source = (
+        Path(candidate.source).name
+        if candidate.kind
+        in {
+            SymbolKind.LOCAL_FUNCTION,
+            SymbolKind.LOCAL_CLASS,
+            SymbolKind.LOCAL_VARIABLE,
+            SymbolKind.IMPORT,
+        }
+        else candidate.source
+    )
+    evidence = f"{candidate.kind.value} from {source}{line}"
+    return IdentifierCorrection(
+        original=identifier,
+        suggested=candidate.name,
+        kind=candidate.kind,
+        score=score,
+        label=match_label(score),
+        reason=reason,
+        evidence=evidence,
+    )
+
+
+def identifiers_from_code_error(error_text: str | None) -> tuple[str, ...]:
+    """Extract identifier-shaped tokens from recognized compiler/runtime errors."""
+
+    if not error_text:
+        return ()
+    sample = error_text[-65536:]
+    patterns = (
+        r"(?:NameError:\s*)?name\s+['\"‘’]([A-Za-z_$][\w$]*)['\"‘’]\s+is not defined",
+        r"\b([A-Za-z_$][\w$]*)\s+is not defined\b",
+        r"(?:use of )?undeclared identifier\s+['\"‘’]([A-Za-z_$][\w$]*)['\"‘’]",
+        r"['\"‘’]([A-Za-z_$][\w$]*)['\"‘’]\s+(?:was not declared|undeclared)",
+        r"implicit declaration of function\s+['\"‘’]([A-Za-z_$][\w$]*)['\"‘’]",
+        r"cannot find symbol[\s\S]{0,240}?symbol:\s+(?:method|variable|class)\s+([A-Za-z_$][\w$]*)",
+    )
+    found: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, sample, re.IGNORECASE | re.MULTILINE):
+            identifier = match.group(1)
+            key = identifier.casefold()
+            if key not in seen:
+                seen.add(key)
+                found.append(identifier)
+    return tuple(found)
+
+
+def render_code_error_diagnostic(
+    understanding: LanguageUnderstanding,
+    identifiers: tuple[str, ...],
+) -> str | None:
+    """Render only useful, evidence-backed identifier findings after a failure."""
+
+    findings: list[str] = []
+    for identifier in identifiers:
+        classification = classify_identifier(identifier, understanding)
+        if classification.kind is not SymbolKind.UNKNOWN:
+            findings.append(f"  {identifier}: {classification.kind.value}")
+            continue
+        correction = find_identifier_correction(identifier, understanding)
+        if correction is not None:
+            findings.extend(
+                (
+                    f"  {identifier} -> {correction.suggested}  [i]",
+                    f"  Kind: {correction.kind.value} | Match: "
+                    f"{correction.score}/100 ({correction.label.value})",
+                    f"  Evidence: {correction.evidence}",
+                )
+            )
+    if not findings:
+        return None
+    return "\n".join(
+        (
+            "Code diagnostic:",
+            f"  Language: {understanding.context.language.value}",
+            *findings,
+            "  Source was not modified; apply the change in your editor.",
+        )
+    )
 
 
 def windows_extensions(env: dict[str, str]) -> tuple[str, ...]:
@@ -1777,10 +2797,21 @@ def prepare_preflight(
     env: dict[str, str] | None = None,
     windows: bool | None = None,
     cwd: str | os.PathLike[str] | Path | None = None,
+    explicit_language: str | SourceLanguage | None = None,
+    explicit_shell: str | None = None,
+    error_text: str | None = None,
 ) -> PreflightAnalysis:
     """Prepare proof-backed corrections and safety evidence without execution."""
 
     original = tuple(str(token) for token in argv)
+    language_understanding = understand_language_context(
+        original,
+        cwd=cwd,
+        env=env,
+        explicit_language=explicit_language,
+        explicit_shell=explicit_shell,
+        error_text=error_text,
+    )
     resolved = command_exists(original[0], env) if original else None
     executable_correction = None
     if original and resolved is None:
@@ -1803,6 +2834,7 @@ def prepare_preflight(
         original_safety=original_safety,
         suggested_safety=suggested_safety,
         risk_increased=risk_increased,
+        language_understanding=language_understanding,
     )
 
 
@@ -2346,6 +3378,21 @@ def run_command(
     if not error_sample.strip():
         print("No stderr evidence was available for correction.", file=output)
         return EXIT_NOT_FOUND
+    code_error_identifiers = identifiers_from_code_error(error_sample)
+    if code_error_identifiers:
+        failure_understanding = understand_language_context(
+            command_to_run,
+            cwd=cwd,
+            env=env,
+            error_text=error_sample,
+        )
+        code_diagnostic = render_code_error_diagnostic(
+            failure_understanding,
+            code_error_identifiers,
+        )
+        if code_diagnostic is not None:
+            print(code_diagnostic, file=output)
+            print("", file=output)
     analysis = analyze_error_message(
         error_sample,
         command_to_run,
@@ -2435,6 +3482,162 @@ def strip_separator(command: list[str]) -> list[str]:
     return command[1:] if command and command[0] == "--" else command
 
 
+def render_language_understanding(
+    understanding: LanguageUnderstanding,
+    *,
+    identifiers: tuple[str, ...] = (),
+) -> str:
+    """Render an opt-in diagnostic view while keeping ordinary correction UI small."""
+
+    context = understanding.context
+    lines = [
+        "Language context:",
+        f"  Shell: {context.shell}",
+        f"  Tool: {context.tool or 'Unknown'}",
+        f"  Language: {context.language.value}",
+        f"  Confidence: {context.confidence.value}",
+        f"  Deep profile: {'yes' if context.deep_profile else 'no'}",
+        "  Source files:",
+    ]
+    if context.source_files:
+        lines.extend(f"    - {Path(path).name}" for path in context.source_files)
+    else:
+        lines.append("    - none explicitly named")
+    lines.append("  Evidence:")
+    lines.extend(f"    - {item}" for item in context.evidence)
+
+    local_symbols = tuple(
+        symbol
+        for symbol in understanding.symbols
+        if symbol.kind
+        in {
+            SymbolKind.LOCAL_FUNCTION,
+            SymbolKind.LOCAL_CLASS,
+            SymbolKind.LOCAL_VARIABLE,
+            SymbolKind.IMPORT,
+        }
+    )
+    lines.append("Local declarations:")
+    if local_symbols:
+        display_priority = {
+            SymbolKind.LOCAL_FUNCTION: 1,
+            SymbolKind.LOCAL_CLASS: 2,
+            SymbolKind.IMPORT: 3,
+            SymbolKind.LOCAL_VARIABLE: 4,
+        }
+        ordered_symbols = tuple(
+            sorted(
+                local_symbols,
+                key=lambda item: (
+                    display_priority.get(item.kind, 99),
+                    item.name.casefold(),
+                    item.name,
+                    item.line or 0,
+                ),
+            )
+        )
+        display_limit = 12
+        for symbol in ordered_symbols[:display_limit]:
+            location = f"{Path(symbol.source).name}:{symbol.line}" if symbol.line else Path(symbol.source).name
+            lines.append(f"  - {symbol.name}: {symbol.kind.value} ({location})")
+        if len(ordered_symbols) > display_limit:
+            lines.append(
+                f"  - ... {len(ordered_symbols) - display_limit} more available to the backend"
+            )
+    else:
+        lines.append("  - none discovered")
+
+    if identifiers:
+        lines.append("Identifier checks:")
+        for identifier in identifiers:
+            classification = classify_identifier(identifier, understanding)
+            if classification.kind is not SymbolKind.UNKNOWN:
+                location = (
+                    f" line {classification.line}" if classification.line is not None else ""
+                )
+                source = (
+                    Path(classification.source).name
+                    if classification.kind
+                    in {
+                        SymbolKind.LOCAL_FUNCTION,
+                        SymbolKind.LOCAL_CLASS,
+                        SymbolKind.LOCAL_VARIABLE,
+                        SymbolKind.IMPORT,
+                    }
+                    else classification.source
+                )
+                lines.append(
+                    f"  - {identifier}: {classification.kind.value} "
+                    f"({source}{location})"
+                )
+                continue
+            correction = find_identifier_correction(identifier, understanding)
+            if correction is None:
+                lines.append(f"  - {identifier}: unknown; no reliable correction")
+            else:
+                lines.append(
+                    f"  - {identifier} -> {correction.suggested}: "
+                    f"{correction.kind.value}, {correction.score}/100 "
+                    f"({correction.label.value})"
+                )
+                lines.append(f"    Evidence: {correction.evidence}")
+    lines.extend(
+        (
+            "Scope: only explicitly named source files were inspected; no recursive scan.",
+            "Nothing was executed or modified.",
+        )
+    )
+    return "\n".join(lines)
+
+
+def context_command(
+    argv: list[str],
+    *,
+    identifiers: tuple[str, ...] = (),
+    explicit_language: str | SourceLanguage | None = None,
+    explicit_shell: str | None = None,
+    error_text: str | None = None,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    output: object = sys.stdout,
+    error_output: object = sys.stderr,
+) -> int:
+    """Inspect language and identifier context without executing a command."""
+
+    if not argv:
+        print("termfix: no command was supplied", file=error_output)
+        return EXIT_USAGE
+    try:
+        understanding = understand_language_context(
+            argv,
+            cwd=cwd,
+            env=env,
+            explicit_language=explicit_language,
+            explicit_shell=explicit_shell,
+            error_text=error_text,
+        )
+    except ValueError as error:
+        print(f"termfix: {error}", file=error_output)
+        return EXIT_USAGE
+    automatic_identifiers = identifiers_from_code_error(error_text)
+    combined_identifiers = tuple(
+        dict.fromkeys(
+            (
+                *(str(item) for item in identifiers),
+                *automatic_identifiers,
+            )
+        )
+    )
+    print(
+        render_language_understanding(
+            understanding,
+            identifiers=combined_identifiers,
+        ),
+        file=output,
+    )
+    return EXIT_OK
+
+
 def make_parser() -> argparse.ArgumentParser:
     """Create the TermFix command-line parser."""
 
@@ -2468,6 +3671,32 @@ def make_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
 
+    context = actions.add_parser(
+        "context",
+        help="inspect language and local symbols without executing anything",
+    )
+    context.add_argument(
+        "--language",
+        help="explicit language override, such as python, js, c, cpp, or java",
+    )
+    context.add_argument(
+        "--shell",
+        help="explicit outer-shell label for diagnostics",
+    )
+    context.add_argument(
+        "--error-text",
+        metavar="TEXT",
+        help="optional compiler/runtime error evidence",
+    )
+    context.add_argument(
+        "--identifier",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="classify or correct an identifier; may be repeated",
+    )
+    context.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
+
     actions.add_parser("self-test", help="run the embedded standard-library tests")
     return parser
 
@@ -2495,6 +3724,14 @@ def cli(argv: list[str] | None = None) -> int:
         return safety_command(strip_separator(args.command))
     if args.action == "run":
         return run_command(strip_separator(args.command))
+    if args.action == "context":
+        return context_command(
+            strip_separator(args.command),
+            identifiers=tuple(args.identifier),
+            explicit_language=args.language,
+            explicit_shell=args.shell,
+            error_text=args.error_text,
+        )
     return EXIT_USAGE
 
 
@@ -3769,6 +5006,383 @@ class TermFixTests(unittest.TestCase):
 
         self.assertNotIn("super-secret", rendered)
         self.assertIn("--token <redacted>", rendered)
+
+    def test_language_detection_for_five_deep_profiles(self) -> None:
+        cases = (
+            (["python", "main.py"], SourceLanguage.PYTHON),
+            (["node", "app.js"], SourceLanguage.JAVASCRIPT),
+            (["gcc", "main.c"], SourceLanguage.C),
+            (["g++", "main.cpp"], SourceLanguage.CPP),
+            (["javac", "Main.java"], SourceLanguage.JAVA),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            for argv, expected in cases:
+                context = detect_language_context(argv, cwd=folder, env={})
+                self.assertEqual(context.language, expected)
+                self.assertTrue(context.deep_profile)
+                self.assertEqual(context.confidence, DetectionConfidence.HIGH)
+
+    def test_declared_additional_language_extensions_are_detectable(self) -> None:
+        cases = (
+            ("app.ts", SourceLanguage.TYPESCRIPT),
+            ("Program.cs", SourceLanguage.CSHARP),
+            ("main.go", SourceLanguage.GO),
+            ("main.rs", SourceLanguage.RUST),
+            ("app.rb", SourceLanguage.RUBY),
+            ("index.php", SourceLanguage.PHP),
+            ("Main.kt", SourceLanguage.KOTLIN),
+            ("main.swift", SourceLanguage.SWIFT),
+            ("main.dart", SourceLanguage.DART),
+            ("main.lua", SourceLanguage.LUA),
+            ("main.pl", SourceLanguage.PERL),
+            ("analysis.r", SourceLanguage.R),
+            ("main.jl", SourceLanguage.JULIA),
+            ("build.sh", SourceLanguage.SHELL),
+            ("build.ps1", SourceLanguage.POWERSHELL),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            for filename, expected in cases:
+                context = detect_language_context(["custom", filename], cwd=folder, env={})
+                self.assertEqual(context.language, expected)
+                self.assertFalse(context.deep_profile)
+
+    def test_language_tool_and_source_conflict_returns_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            context = detect_language_context(
+                ["python", "main.js"],
+                cwd=folder,
+                env={},
+            )
+
+        self.assertEqual(context.language, SourceLanguage.UNKNOWN)
+        self.assertIn("conflict", " ".join(context.evidence))
+
+    def test_explicit_language_override_wins_and_is_recorded(self) -> None:
+        context = detect_language_context(
+            ["mystery", "main.unknown"],
+            env={},
+            explicit_language="cpp",
+        )
+
+        self.assertEqual(context.language, SourceLanguage.CPP)
+        self.assertEqual(context.confidence, DetectionConfidence.HIGH)
+        self.assertIn("explicit language override", context.evidence[0])
+
+    def test_invalid_explicit_language_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            detect_language_context(["tool"], env={}, explicit_language="braincode")
+
+    def test_extensionless_python_shebang_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "worker"
+            script.write_text("#!/usr/bin/env python3\nprint('ok')\n", encoding="utf-8")
+            context = detect_language_context([str(script)], cwd=folder, env={})
+
+        self.assertEqual(context.language, SourceLanguage.PYTHON)
+        self.assertEqual(context.source_files, (str(script.resolve()),))
+
+    def test_compiler_error_shape_can_supply_language_evidence(self) -> None:
+        context = detect_language_context(
+            ["unknown-tool"],
+            env={},
+            error_text="main.c:12:5: error: expected ';' before '}' token",
+        )
+
+        self.assertEqual(context.language, SourceLanguage.C)
+        self.assertEqual(context.confidence, DetectionConfidence.MEDIUM)
+
+    def test_direct_project_marker_is_low_confidence_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "package.json").write_text("{}", encoding="utf-8")
+            context = detect_language_context(["unknown-tool"], cwd=folder, env={})
+
+        self.assertEqual(context.language, SourceLanguage.JAVASCRIPT)
+        self.assertEqual(context.confidence, DetectionConfidence.LOW)
+
+    def test_shell_override_and_environment_detection(self) -> None:
+        self.assertEqual(detect_shell({}, explicit_shell="fish"), "fish")
+        self.assertEqual(detect_shell({"SHELL": "/bin/zsh"}), "zsh")
+        self.assertEqual(
+            detect_shell({"PSModulePath": "C:/modules", "COMSPEC": "cmd.exe"}),
+            "PowerShell-compatible environment",
+        )
+
+    def test_preflight_contains_language_understanding(self) -> None:
+        with mock.patch(__name__ + ".command_exists", return_value="C:/Python/python.exe"):
+            preflight = prepare_preflight(["python", "main.py"], env={}, cwd=".")
+
+        self.assertEqual(
+            preflight.language_understanding.context.language,
+            SourceLanguage.PYTHON,
+        )
+
+    def test_python_ast_extracts_and_classifies_local_symbols(self) -> None:
+        source_text = (
+            "import math as maths\n"
+            "total = 0\n"
+            "def calculate(value):\n    return value + total\n"
+            "class Engine:\n    pass\n"
+            "# def phantom(): pass\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "main.py"
+            source.write_text(source_text, encoding="utf-8")
+            understanding = understand_language_context(
+                ["python", str(source)],
+                cwd=folder,
+                env={},
+            )
+
+        kinds = {(symbol.name, symbol.kind) for symbol in understanding.symbols}
+        self.assertIn(("calculate", SymbolKind.LOCAL_FUNCTION), kinds)
+        self.assertIn(("Engine", SymbolKind.LOCAL_CLASS), kinds)
+        self.assertIn(("total", SymbolKind.LOCAL_VARIABLE), kinds)
+        self.assertIn(("maths", SymbolKind.IMPORT), kinds)
+        self.assertNotIn("phantom", {symbol.name for symbol in understanding.symbols})
+        self.assertEqual(classify_identifier("while", understanding).kind, SymbolKind.KEYWORD)
+        self.assertEqual(classify_identifier("print", understanding).kind, SymbolKind.BUILTIN)
+
+    def test_javascript_extractor_ignores_comments_and_strings(self) -> None:
+        source_text = (
+            "// function phantom() {}\n"
+            "const text = 'class Fake {}';\n"
+            "function calculate(value) { return value; }\n"
+            "const transform = (value) => value;\n"
+            "class Engine {}\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "app.js"
+            source.write_text(source_text, encoding="utf-8")
+            understanding = understand_language_context(["node", str(source)], cwd=folder, env={})
+
+        kinds = {(symbol.name, symbol.kind) for symbol in understanding.symbols}
+        self.assertIn(("calculate", SymbolKind.LOCAL_FUNCTION), kinds)
+        self.assertIn(("transform", SymbolKind.LOCAL_FUNCTION), kinds)
+        self.assertIn(("Engine", SymbolKind.LOCAL_CLASS), kinds)
+        self.assertNotIn("phantom", {symbol.name for symbol in understanding.symbols})
+        self.assertNotIn("Fake", {symbol.name for symbol in understanding.symbols})
+
+    def test_java_extractor_finds_class_method_and_constructor(self) -> None:
+        source_text = (
+            "public class Calculator {\n"
+            "  public Calculator() {}\n"
+            "  public static int calculate(int value) { return value; }\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "Calculator.java"
+            source.write_text(source_text, encoding="utf-8")
+            understanding = understand_language_context(["javac", str(source)], cwd=folder, env={})
+
+        kinds = {(symbol.name, symbol.kind) for symbol in understanding.symbols}
+        self.assertIn(("Calculator", SymbolKind.LOCAL_CLASS), kinds)
+        self.assertIn(("Calculator", SymbolKind.LOCAL_FUNCTION), kinds)
+        self.assertIn(("calculate", SymbolKind.LOCAL_FUNCTION), kinds)
+        self.assertEqual(
+            classify_identifier("System", understanding).kind,
+            SymbolKind.STANDARD_LIBRARY,
+        )
+
+    def test_c_extractor_and_standard_library_classification(self) -> None:
+        source_text = (
+            "#include <stdio.h>\n"
+            "int calculate(int value) { return value; }\n"
+            "int main(void) { printf(\"ok\"); return calculate(1); }\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "main.c"
+            source.write_text(source_text, encoding="utf-8")
+            understanding = understand_language_context(["gcc", str(source)], cwd=folder, env={})
+
+        self.assertEqual(
+            classify_identifier("calculate", understanding).kind,
+            SymbolKind.LOCAL_FUNCTION,
+        )
+        self.assertEqual(
+            classify_identifier("printf", understanding).kind,
+            SymbolKind.STANDARD_LIBRARY,
+        )
+        self.assertEqual(classify_identifier("while", understanding).kind, SymbolKind.KEYWORD)
+
+    def test_cpp_extractor_finds_class_and_qualified_method(self) -> None:
+        source_text = (
+            "class Calculator { public: int calculate(int value); };\n"
+            "int Calculator::calculate(int value) { return value; }\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "main.cpp"
+            source.write_text(source_text, encoding="utf-8")
+            understanding = understand_language_context(["g++", str(source)], cwd=folder, env={})
+
+        kinds = {(symbol.name, symbol.kind) for symbol in understanding.symbols}
+        self.assertIn(("Calculator", SymbolKind.LOCAL_CLASS), kinds)
+        self.assertIn(("calculate", SymbolKind.LOCAL_FUNCTION), kinds)
+
+    def test_malformed_python_source_does_not_crash_or_invent_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "broken.py"
+            source.write_text("def calculate(:\n", encoding="utf-8")
+            understanding = understand_language_context(["python", str(source)], cwd=folder, env={})
+
+        self.assertEqual(understanding.symbols, ())
+
+    def test_oversized_source_is_not_scanned_for_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "large.py"
+            source.write_text("x" * (MAX_SOURCE_BYTES + 1), encoding="utf-8")
+            understanding = understand_language_context(["python", str(source)], cwd=folder, env={})
+
+        self.assertEqual(understanding.context.language, SourceLanguage.PYTHON)
+        self.assertEqual(understanding.symbols, ())
+
+    def test_only_explicit_source_file_is_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            named = root / "main.py"
+            hidden = root / "nested" / "other.py"
+            hidden.parent.mkdir()
+            named.write_text("def visible(): pass\n", encoding="utf-8")
+            hidden.write_text("def hidden_symbol(): pass\n", encoding="utf-8")
+            understanding = understand_language_context(["python", str(named)], cwd=root, env={})
+
+        names = {symbol.name for symbol in understanding.symbols}
+        self.assertIn("visible", names)
+        self.assertNotIn("hidden_symbol", names)
+
+    def test_local_function_typo_gets_source_backed_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "main.c"
+            source.write_text("int calculate(int x) { return x; }\n", encoding="utf-8")
+            understanding = understand_language_context(["gcc", str(source)], cwd=folder, env={})
+            correction = find_identifier_correction("calcluate", understanding)
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested, "calculate")
+        self.assertEqual(correction.kind, SymbolKind.LOCAL_FUNCTION)
+        self.assertEqual(correction.label, MatchLabel.HIGH)
+
+    def test_keyword_typo_uses_current_language_profile(self) -> None:
+        understanding = understand_language_context(["gcc", "main.c"], env={})
+        correction = find_identifier_correction("whlie", understanding)
+
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction.suggested, "while")
+        self.assertEqual(correction.kind, SymbolKind.KEYWORD)
+
+    def test_unrelated_identifier_is_not_guessed(self) -> None:
+        understanding = understand_language_context(["gcc", "main.c"], env={})
+        self.assertIsNone(find_identifier_correction("totallyDifferentName", understanding))
+
+    def test_identifier_candidate_ranking_is_deterministic(self) -> None:
+        understanding = understand_language_context(["gcc", "main.c"], env={})
+        first = find_identifier_correction("whlie", understanding)
+        second = find_identifier_correction("whlie", understanding)
+        self.assertEqual(first, second)
+
+    def test_context_command_is_read_only_and_explains_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "main.c"
+            source.write_text("int calculate(int x) { return x; }\n", encoding="utf-8")
+            output = self._output()
+            error_output = self._output()
+            with mock.patch(__name__ + ".subprocess.run") as runner:
+                code = context_command(
+                    ["gcc", str(source)],
+                    identifiers=("calcluate", "while", "printf"),
+                    cwd=folder,
+                    env={},
+                    output=output,
+                    error_output=error_output,
+                )
+
+        rendered = output.getvalue()
+        self.assertEqual(code, EXIT_OK)
+        runner.assert_not_called()
+        self.assertIn("Language: C", rendered)
+        self.assertIn("calcluate -> calculate", rendered)
+        self.assertIn("while: keyword", rendered)
+        self.assertIn("printf: standard-library symbol", rendered)
+        self.assertIn("Nothing was executed or modified.", rendered)
+
+    def test_context_command_rejects_invalid_override(self) -> None:
+        error_output = self._output()
+        code = context_command(
+            ["tool"],
+            explicit_language="not-a-language",
+            env={},
+            output=self._output(),
+            error_output=error_output,
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("unsupported language", error_output.getvalue())
+
+    def test_code_error_identifier_patterns_are_bounded_and_deterministic(self) -> None:
+        samples = (
+            ("NameError: name 'calcluate' is not defined", ("calcluate",)),
+            ("ReferenceError: calcluate is not defined", ("calcluate",)),
+            ("error: use of undeclared identifier 'calcluate'", ("calcluate",)),
+            ("error: ‘calcluate’ was not declared in this scope", ("calcluate",)),
+            (
+                "error: cannot find symbol\n  symbol: method calcluate(int)",
+                ("calcluate",),
+            ),
+        )
+        for error_text, expected in samples:
+            self.assertEqual(identifiers_from_code_error(error_text), expected)
+
+    def test_context_automatically_checks_identifier_from_error_text(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "main.c"
+            source.write_text("int calculate(int x) { return x; }\n", encoding="utf-8")
+            output = self._output()
+            code = context_command(
+                ["gcc", str(source)],
+                error_text="main.c:3: error: ‘calcluate’ undeclared",
+                cwd=folder,
+                env={},
+                output=output,
+                error_output=self._output(),
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("calcluate -> calculate", output.getvalue())
+
+    def test_failed_compile_reports_code_typo_without_editing_or_retrying(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "main.c"
+            original_source = "int calculate(int x) { return x; }\n"
+            source.write_text(original_source, encoding="utf-8")
+            failure = subprocess.CompletedProcess(
+                ["gcc", str(source)],
+                1,
+                stdout="",
+                stderr="main.c:3: error: ‘calcluate’ undeclared",
+            )
+            runner = mock.Mock(return_value=failure)
+            output = self._output()
+            with mock.patch(
+                __name__ + ".command_exists",
+                return_value="C:/Tools/gcc.exe",
+            ):
+                code = run_command(
+                    ["gcc", str(source)],
+                    cwd=folder,
+                    env={},
+                    runner=runner,
+                    output=output,
+                    error_output=self._output(),
+                )
+            unchanged_source = source.read_text(encoding="utf-8")
+
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(unchanged_source, original_source)
+        self.assertIn("Code diagnostic:", output.getvalue())
+        self.assertIn("calcluate -> calculate", output.getvalue())
+        self.assertIn("Source was not modified", output.getvalue())
 
     @staticmethod
     def _output():
