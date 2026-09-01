@@ -261,6 +261,7 @@ See [SECURITY.md](SECURITY.md) for the complete threat model, controls and limit
 
 ## Technical documentation
 
+- [STDLIB.md](STDLIB.md) — complete dependency receipt, package substitutions and honest trade-offs.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — correction algorithms, evidence ranking and execution flow.
 - [SECURITY.md](SECURITY.md) — threat model, risk rules, privacy and safety boundaries.
 - [DEVELOPMENT.md](DEVELOPMENT.md) — development history, builds, tests, activation and exit codes.
